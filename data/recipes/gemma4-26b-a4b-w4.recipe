@@ -1,0 +1,23 @@
+# gemma4-26b-a4b-w4.recipe -- Gemma 4 26B-A4B (or a finetune of it) on one 20 GB card: every routed
+# expert at four bits, the rest as the checkpoint ships it.
+#
+#   - Every routed expert's gate_up and down projection as two's-complement int4 codes (-8..7) with
+#     a bf16 scale per (row, 128 of K), round to nearest, no rotation (a group-128 absmax already
+#     handles range; rotation pays only under GPTQ, docs/MOE-W4.md). The grouped GEMM reads them
+#     at w4a8 against the E4M3 codes of the experts' inputs (rmsnorm_quant_fp8, quant_act_fp8).
+#     They are nine tenths of the weight bytes: about 12.8 GB here against 45 GB at bf16.
+#   - The down projection's K is the expert width, 704, which whole 128-column scale groups do not
+#     tile. Pad the checkpoint's experts to 768 first (zero rows of gate and up, zero columns of
+#     down: gelu_tanh(0) * 0 = 0 meets zero columns, so the function is unchanged) and convert the
+#     padded checkpoint; arch/gemma4/gemma4.cpp, "FP8 EXPERTS".
+#   - The attention, the dense arm, the norms, the router, the embedding and the vision tower stay
+#     bf16: about 4.8 GB, and arch/gemma4 declares no quantised attention or dense arm.
+#
+#   rad-convert <padded gemma-4-26B-A4B-it> --recipe data/recipes/gemma4-26b-a4b-w4.recipe \
+#       -o gemma4-26b-a4b-w4.rad
+#
+# About 17.7 GB in all, which leaves a 20 GB card some 2 GiB for the KV cache and activations
+# (serve with mm-max-patches: 0 to keep the vision tower off the card).
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=i4 group=128 scale=bf16
+blk.*.ffn_down_exps.*.weight         rtn codes=i4 group=128 scale=bf16
