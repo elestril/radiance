@@ -22,8 +22,9 @@
  * Tolerance. Every step but two is one IEEE f32 operation or a rounding, the same on the host and
  * on the card, so given its inputs a stored value is exact. The two are the norm factor and the
  * reciprocal of a quantiser's scale. The card sums a row's squares over threads and waves in the
- * kernel's order (23 adds a thread, five butterfly rounds, seven waves and the square: 36
- * roundings of a sum of non-negative terms, at most 1.1e-6 on the factor), then divides and takes
+ * kernel's order (at 256 threads 23 adds a thread, five butterfly rounds and seven waves, in the
+ * 1024-thread decode form two, five and 31, and the square: at most 39 roundings of a sum of
+ * non-negative terms, 1.2e-6 on the factor), then divides and takes
  * a reciprocal square root, neither of which a card has to round correctly. The host therefore
  * takes each factor as an interval, kFactorTol (2^-19, 1.9e-6) either side of
  * 1 / sqrt(mean + eps) computed in double from the exact squares, and each reciprocal as three
@@ -40,6 +41,12 @@
  * Elements whose range is not a single value are counted, printed and bounded (kOpenShare), so
  * the comparison cannot become an empty one; the int8 groups compared against a choice are
  * counted and printed too. Padding columns and the row past M must come back untouched.
+ *
+ * Forms. A launch of at most 64 rows and 3072 columns takes the 1024-thread form (not the int8
+ * route), a wider row 24 columns a thread, the rest 12. Each launch of at most 64 rows is also
+ * made with the parameter `chain` = 1, as the engine resolves a row it chains: the kernels'
+ * chained forms. No engine record is in the argument segment here, so a chained form neither
+ * waits nor adds, and what is compared is its arithmetic.
  */
 #include "rad_abi.h"
 #include "rad_plugin.h"
@@ -326,11 +333,12 @@ int verdict(const std::string& name, std::initializer_list<const Tally*> tallies
     return ok ? 0 : 1;
 }
 
-/* A join's parameters as the gemma4 plugin states them. */
+/* A join's parameters as the gemma4 plugin states them; `chain` as the engine adds it. */
 struct Params {
     std::vector<RadParam> params;
-    Params(int M, int n) {
+    Params(int M, int n, bool chain = false) {
         params = {RAD_INT("M", M), RAD_INT("n", n), RAD_F64("eps", 1e-6f), RAD_STR("dtype", "bf16")};
+        if (chain) params.push_back(RAD_INT("chain", 1));
     }
 };
 
@@ -570,13 +578,16 @@ int main(int argc, char** argv) {
     hip_check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
     int failures = 0;
     for (int M : heights)
-        for (int n : widths) {
-            const Params geometry(M, n);
-            for (int route = 0; route < 3; ++route)
-                failures += case_attention(*kernels[route], stream, geometry, M, n, route, false, "");
-            for (bool next : {false, true})
-                failures += case_feed_forward(*kernels[3], stream, geometry, M, n, next, "");
-        }
+        for (int n : widths)
+            for (bool chain : {false, true}) {
+                if (chain && M > 64) continue;
+                const Params geometry(M, n, chain);
+                const char* note = chain ? " chained" : "";
+                for (int route = 0; route < 3; ++route)
+                    failures += case_attention(*kernels[route], stream, geometry, M, n, route, false, note);
+                for (bool next : {false, true})
+                    failures += case_feed_forward(*kernels[3], stream, geometry, M, n, next, note);
+            }
     for (int route = 1; route < 3; ++route)
         failures += case_attention(*kernels[route], stream, Params(8, 2816), 8, 2816, route, true, " (a zero group)");
     hip_check(hipStreamDestroy(stream));

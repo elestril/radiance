@@ -1,6 +1,8 @@
-/* Ported from libhalo/halo_norm_join_bf16.hip, verbatim but for the halo_ -> r3dh_ rename (identifiers only)
- * and the plugin header, so libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same
- * wave32 family as gfx1100; the unit compiles for the family unchanged. */
+/* Ported from libhalo/halo_norm_join_bf16.hip with the halo_ -> r3dh_ rename (identifiers only)
+ * and the plugin header, so libr3d serves the op on every gfx11 card. libhalo targets gfx1151,
+ * the same wave32 family as gfx1100. libr3d's changes to libhalo's kernels are marked `libr3d:`:
+ * loads at a clamped index, barriers for LDS alone, a branch-free E4M3 encode, a form of 1024
+ * threads a row at decode heights, and the chained forms (r3d_chain.h). */
 /* Derived from libr4d/r4d_norm_join_bf16.hip by the libhalo rename transform (2026-10-26),
  * then ported to gfx1151; see libhalo/README.md. */
 /* r3dh_norm_join_bf16.hip -- Gemma 4's sandwich-norm joins, each one kernel instead of a chain.
@@ -51,6 +53,7 @@
 #include "r3dh_fp8_wmma.h"   // r3dh_fp8::cvt_pk_fp8_f32 (no fp8-conversion-insts on gfx1151)
 #include "r3dh_launch.h"
 #include "r3dh_q8.h"       // norm_add_norm_route_i8g's rotated int8 codes
+#include "r3d_chain.h"      // libr3d: the joins' chained forms
 #include "rad_plugin.h"
 
 namespace r3dh_join {
@@ -70,30 +73,51 @@ __device__ __forceinline__ int lane_id() { return (int)(threadIdx.x & 31u); }
 __device__ __forceinline__ float shfl_xor(float v, int m) {
     return __int_as_float(__builtin_amdgcn_ds_bpermute((lane_id() ^ m) << 2, __float_as_int(v)));
 }
+/* libr3d: r3dh_fp8::f32_to_e4m3 for a finite v of magnitude at most 448, without its branches:
+ * below 2^-6 the code is v * 2^9 rounded to nearest even, above it the f32 rounded to three
+ * mantissa bits (nearest even, the carry into the exponent) with the exponent rebased. Checked
+ * against f32_to_e4m3 on every such f32, both signs (2.28e9 values, no difference). Inlined twelve
+ * times a thread, f32_to_e4m3's branches were most of the kernel's code, and a decode layer
+ * fetches it cold. */
+__device__ __forceinline__ uint32_t e4m3_sat(float v) {
+    const uint32_t u = __float_as_uint(v), s = (u >> 24) & 0x80u, a = u & 0x7fffffffu;
+    const uint32_t sub = (uint32_t)rintf(__uint_as_float(a) * 512.0f);
+    const uint32_t t = a + 0x7ffffu + ((a >> 20) & 1u);
+    const uint32_t nrm = (t >> 20) - (120u << 3);
+    return s | (a < 0x3c800000u ? sub : nrm);
+}
+/* libr3d: a barrier for LDS alone. __syncthreads() is a workgroup-scope fence as well, which on
+ * gfx11 waits for the thread's global stores to land (s_waitcnt vscnt(0)): a store round trip at
+ * every reduction behind a store of the row. Only LDS is exchanged across these barriers. */
+__device__ __forceinline__ void lds_barrier() {
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
 /* the block's sum, every thread the same value: a wave butterfly, then the waves in order */
+template <int NW = kWaves>
 __device__ __forceinline__ float block_sum(float v, float* lds) {
 #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) v += shfl_xor(v, d);
     const int lane = lane_id(), wave = (int)(threadIdx.x >> 5);
-    __syncthreads();                                 /* lds is free: the last read of it is done */
+    lds_barrier();                                   /* lds is free: the last read of it is done */
     if (lane == 0) lds[wave] = v;
-    __syncthreads();
+    lds_barrier();
     float s = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWaves; ++w) s += lds[w];
+    for (int w = 0; w < NW; ++w) s += lds[w];
     return s;
 }
 /* two block sums for one barrier pair: each value takes block_sum's butterfly and wave order */
+template <int NW = kWaves>
 __device__ __forceinline__ void block_sum2(float& a, float& b, float* lds) {
 #pragma unroll
     for (int d = 16; d >= 1; d >>= 1) { a += shfl_xor(a, d); b += shfl_xor(b, d); }
     const int lane = lane_id(), wave = (int)(threadIdx.x >> 5);
-    __syncthreads();
-    if (lane == 0) { lds[wave] = a; lds[kWaves + wave] = b; }
-    __syncthreads();
+    lds_barrier();
+    if (lane == 0) { lds[wave] = a; lds[NW + wave] = b; }
+    lds_barrier();
     float sa = 0.0f, sb = 0.0f;
 #pragma unroll
-    for (int w = 0; w < kWaves; ++w) { sa += lds[w]; sb += lds[kWaves + w]; }
+    for (int w = 0; w < NW; ++w) { sa += lds[w]; sb += lds[NW + w]; }
     a = sa;
     b = sb;
 }
@@ -127,11 +151,13 @@ struct NormArgs {
  * (ROUTE 1), or at ROUTE 2 had_quant_act_i8g's rotated int8. The rotation's butterfly wants a
  * group in one wave, four columns a lane, where this kernel holds a column a thread, so the
  * experts' bf16 row goes through LDS to that mapping (r3dh_q8.h, q8_row_had_i8g). */
-template <int PER, int ROUTE>
-__global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
-    __shared__ float lds[kWaves];
-    __shared__ float gmax[ROUTE == 1 ? PER * kWaves : 1];
-    __shared__ uint16_t erow[ROUTE == 2 ? PER * kThreads : 1];
+template <int PER, int ROUTE, class CH = HaloUnchained, int NT = kThreads>
+__global__ __launch_bounds__(NT) void norm_add_norm_kernel(NormArgs A) {
+    constexpr int NW = NT / 32;
+    R3D_CHAIN_SCOPE(CH);   /* libr3d: the chained form's bracket; the body has no return */
+    __shared__ float lds[NW];
+    __shared__ float gmax[ROUTE == 1 ? PER * NW : 1];
+    __shared__ uint16_t erow[ROUTE == 2 ? PER * NT : 1];
     const int tid = (int)threadIdx.x, n = A.n;
     const long long m = (long long)blockIdx.x;
     const uint16_t* ar = A.a + m * A.a_ld;
@@ -139,28 +165,34 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
     uint16_t* yr = A.y + m * A.y_ld;
 
     /* every operand of the row in flight at once: the block output, the residual, the gains */
+    /* libr3d: each load unconditional at a clamped index and the padding zeroed after it. Loads
+     * under `i < n` became a branch each, and the compiler waited on every bf16 load before the
+     * next: 24 round trips in a row, ~20 us of a 26B-A4B decode layer on an RX 7900 XT. */
     float av[PER], xv[PER], wa[PER], wy[PER], wr[ROUTE ? PER : 1], we[ROUTE ? PER : 1];
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         const bool in = i < n;
-        av[k] = in ? bf2f(ar[i]) : 0.0f;
-        xv[k] = in ? bf2f(xr[i]) : 0.0f;
-        wa[k] = in ? A.w0[i] : 0.0f;
-        wy[k] = in ? A.w1[i] : 0.0f;
+        const int ic = in ? i : n - 1;
+        const float a0 = bf2f(ar[ic]), x0 = bf2f(xr[ic]), wa0 = A.w0[ic], wy0 = A.w1[ic];
+        av[k] = in ? a0 : 0.0f;
+        xv[k] = in ? x0 : 0.0f;
+        wa[k] = in ? wa0 : 0.0f;
+        wy[k] = in ? wy0 : 0.0f;
         if constexpr (ROUTE) {
-            wr[k] = in ? A.w2[i] : 0.0f;
-            we[k] = in ? A.w3[i] : 0.0f;
+            const float wr0 = A.w2[ic], we0 = A.w3[ic];
+            wr[k] = in ? wr0 : 0.0f;
+            we[k] = in ? we0 : 0.0f;
         }
     }
     float ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < PER; ++k) ss += av[k] * av[k];
-    const float sa = norm_factor(block_sum(ss, lds), n, A.eps);
+    const float sa = norm_factor(block_sum<NW>(ss, lds), n, A.eps);
     ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         if (i < n) {
             const float t = rbf((av[k] * sa) * wa[k]);
             xv[k] = rbf(xv[k] + t);
@@ -168,11 +200,11 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
         }
         ss += xv[k] * xv[k];
     }
-    const float sx = norm_factor(block_sum(ss, lds), n, A.eps);
+    const float sx = norm_factor(block_sum<NW>(ss, lds), n, A.eps);
     uint16_t* rr = ROUTE ? A.rt + m * A.rt_ld : nullptr;
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         if (i < n) {
             yr[i] = f2bf((xv[k] * sx) * wy[k]);
             if constexpr (ROUTE) {
@@ -186,8 +218,8 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
         }
     }
     if constexpr (ROUTE == 2) {
-        __syncthreads();
-        q8_row_had_i8g<kThreads>(erow, (signed char*)(A.q + m * A.q_ld), A.qs + m * A.qs_ld,
+        lds_barrier();   /* libr3d: erow is LDS; the row's stores above need not land first */
+        q8_row_had_i8g<NT>(erow, (signed char*)(A.q + m * A.q_ld), A.qs + m * A.qs_ld,
                                  (uint32_t)n);
     }
     if constexpr (ROUTE == 1) {
@@ -198,21 +230,21 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
             float mx = fabsf(av[k]);
 #pragma unroll
             for (int d = 16; d >= 1; d >>= 1) mx = fmaxf(mx, shfl_xor(mx, d));
-            if (lane_id() == 0) gmax[k * kWaves + wave] = mx;
+            if (lane_id() == 0) gmax[k * NW + wave] = mx;
         }
-        __syncthreads();
+        lds_barrier();   /* libr3d: the row's stores above need not land first */
         uint8_t* qr = A.q + m * A.q_ld;
         float* sr = A.qs + m * A.qs_ld;
 #pragma unroll
         for (int k = 0; k < PER; ++k) {
-            const int i = tid + k * kThreads;
+            const int i = tid + k * NT;
             if (i >= n) continue;                    /* n is whole groups: a group is in or out */
-            const float* g = gmax + k * kWaves + 4 * half;
+            const float* g = gmax + k * NW + 4 * half;
             const float am = fmaxf(fmaxf(g[0], g[1]), fmaxf(g[2], g[3]));
             const float sc = am > 0.0f ? am * (1.0f / 448.0f) : 1.0f;
             const float inv = 1.0f / sc;
             const float v = fminf(fmaxf(av[k] * inv, -448.0f), 448.0f);
-            qr[i] = (uint8_t)(r3dh_fp8::cvt_pk_fp8_f32(v, v, 0, false) & 0xff);
+            qr[i] = (uint8_t)e4m3_sat(v);
             if ((tid & 127) == 0) sr[i >> 7] = sc;
         }
     }
@@ -220,9 +252,11 @@ __global__ __launch_bounds__(kThreads) void norm_add_norm_kernel(NormArgs A) {
 
 /* x = (x + norm(norm(d) * w_d + norm(r) * w_r) * w_j) * s, and with NEXT y = norm(x) * w_n: the
  * next layer's input norm taken over the bf16 x this stores, which is what that norm would read. */
-template <int PER, bool NEXT>
-__global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
-    __shared__ float lds[2 * kWaves];
+template <int PER, bool NEXT, class CH = HaloUnchained, int NT = kThreads>
+__global__ __launch_bounds__(NT) void join_add_scale_kernel(NormArgs A) {
+    constexpr int NW = NT / 32;
+    R3D_CHAIN_SCOPE(CH);   /* libr3d: the chained form's bracket; the body has no return */
+    __shared__ float lds[2 * NW];
     const int tid = (int)threadIdx.x, n = A.n;
     const long long m = (long long)blockIdx.x;
     const uint16_t* dr = A.d + m * A.d_ld;
@@ -233,17 +267,24 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
      * with the next norm's) and the layer scalar */
     float dv[PER], rv[PER], xo[PER], wd[PER], wr[PER], wj[PER], wn[NEXT ? PER : 1];
     const float sc = bf2f(*A.s);
+    /* libr3d: unconditional loads at a clamped index, as in norm_add_norm_kernel */
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         const bool in = i < n;
-        dv[k] = in ? bf2f(dr[i]) : 0.0f;
-        rv[k] = in ? bf2f(rr[i]) : 0.0f;
-        xo[k] = in ? bf2f(xr[i]) : 0.0f;
-        wd[k] = in ? A.w0[i] : 0.0f;
-        wr[k] = in ? A.w1[i] : 0.0f;
-        wj[k] = in ? A.w2[i] : 0.0f;
-        if constexpr (NEXT) wn[k] = in ? A.w3[i] : 0.0f;
+        const int ic = in ? i : n - 1;
+        const float d0 = bf2f(dr[ic]), r0 = bf2f(rr[ic]), x0 = bf2f(xr[ic]);
+        const float wd0 = A.w0[ic], wr0 = A.w1[ic], wj0 = A.w2[ic];
+        dv[k] = in ? d0 : 0.0f;
+        rv[k] = in ? r0 : 0.0f;
+        xo[k] = in ? x0 : 0.0f;
+        wd[k] = in ? wd0 : 0.0f;
+        wr[k] = in ? wr0 : 0.0f;
+        wj[k] = in ? wj0 : 0.0f;
+        if constexpr (NEXT) {
+            const float wn0 = A.w3[ic];
+            wn[k] = in ? wn0 : 0.0f;
+        }
     }
     float sd2 = 0.0f, sr2 = 0.0f;
 #pragma unroll
@@ -251,14 +292,14 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
         sd2 += dv[k] * dv[k];
         sr2 += rv[k] * rv[k];
     }
-    block_sum2(sd2, sr2, lds);
+    block_sum2<NW>(sd2, sr2, lds);
     const float sd = norm_factor(sd2, n, A.eps);
     const float sr = norm_factor(sr2, n, A.eps);
     /* the join, kept in dv */
     float ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         if (i < n) {
             const float u = rbf((dv[k] * sd) * wd[k]);
             const float v = rbf((rv[k] * sr) * wr[k]);
@@ -266,11 +307,11 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
         }
         ss += dv[k] * dv[k];
     }
-    const float sj = norm_factor(block_sum(ss, lds), n, A.eps);
+    const float sj = norm_factor(block_sum<NW>(ss, lds), n, A.eps);
     ss = 0.0f;
 #pragma unroll
     for (int k = 0; k < PER; ++k) {
-        const int i = tid + k * kThreads;
+        const int i = tid + k * NT;
         if (i < n) {
             const float j = rbf((dv[k] * sj) * wj[k]);
             const float x1 = rbf(xo[k] + j);
@@ -283,17 +324,40 @@ __global__ __launch_bounds__(kThreads) void join_add_scale_kernel(NormArgs A) {
         if (NEXT) ss += rv[k] * rv[k];
     }
     if (NEXT) {
-        const float sn = norm_factor(block_sum(ss, lds), n, A.eps);
+        const float sn = norm_factor(block_sum<NW>(ss, lds), n, A.eps);
         uint16_t* yr = A.y + m * A.y_ld;
 #pragma unroll
         for (int k = 0; k < PER; ++k) {
-            const int i = tid + k * kThreads;
+            const int i = tid + k * NT;
             if (i < n) yr[i] = f2bf((rv[k] * sn) * wn[k]);
         }
     }
 }
 
 /* ------------------------------------------------------------------ host: the launch adapters */
+
+/* libr3d: the chained form where the entry's flag is set (r3d_chain.h). */
+#define R3DJ_LAUNCH(K, TARGS, ...)                                                               \
+    do {                                                                                          \
+        if (r3dh_chain_flag())                                                                    \
+            R3DH_KLAUNCH(R3DH_KNAME(K<R3D_CHAIN_KARGS_ TARGS r4dchain>), __VA_ARGS__);            \
+        else                                                                                      \
+            R3DH_KLAUNCH(R3DH_KNAME(K<R3D_CHAIN_KARGS_ TARGS HaloUnchained>), __VA_ARGS__);       \
+    } while (0)
+/* ...and the wide form: kWide threads a row, three columns a thread. A decode step's row is one
+ * block, whose cost is mostly the cold fetch of its code; at 256 threads twelve columns a thread
+ * unrolled to ~2300 instructions (norm_add_norm_route) where three come to a quarter of that.
+ * Decode heights only (64 rows or fewer, as the chained forms): a prefill step keeps 256.
+ * The wave sums are the same butterflies over 32 waves instead of 8, so the sums of squares are
+ * added in another order (the header's one allowed difference). */
+constexpr int kWide = 1024;
+#define R3DJ_LAUNCH_W(K, TARGS, ...)                                                             \
+    do {                                                                                          \
+        if (r3dh_chain_flag())                                                                    \
+            R3DH_KLAUNCH(R3DH_KNAME(K<R3D_CHAIN_KARGS_ TARGS r4dchain, kWide>), __VA_ARGS__);     \
+        else                                                                                      \
+            R3DH_KLAUNCH(R3DH_KNAME(K<R3D_CHAIN_KARGS_ TARGS HaloUnchained, kWide>), __VA_ARGS__); \
+    } while (0)
 
 /* [rows..., n] of `dt` with a dense last axis: its row count and pitch, or false */
 static bool rows_as(const RadTensor* t, uint32_t dt, int64_t n, int64_t* rows, int64_t* ld) {
@@ -325,6 +389,7 @@ extern "C" {
 /* operands: a, w_a, x (inout), w_y, y */
 int r3dh_rad_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     using namespace r3dh_join;
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     if (!a || a->n_t < 5) return RAD_E_INVAL;
     int64_t n = 0;
     float eps = 0.0f;
@@ -345,11 +410,14 @@ int r3dh_rad_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
     P.y = (uint16_t*)Y->data;        P.y_ld = ly;
     P.w0 = (const float*)Wa->data;   P.w1 = (const float*)Wy->data;
     P.n = (int)n; P.eps = eps;
-    if (n <= (int64_t)kThreads * 12)
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<12, 0>), dim3((unsigned)M), dim3(kThreads),
+    if (M <= 64 && n <= (int64_t)kWide * 3)
+        R3DJ_LAUNCH_W(norm_add_norm_kernel, (3, 0,), dim3((unsigned)M), dim3(kWide),
+                      (hipStream_t)stream, P);
+    else if (n <= (int64_t)kThreads * 12)
+        R3DJ_LAUNCH(norm_add_norm_kernel, (12, 0,), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<kMaxPer, 0>), dim3((unsigned)M),
+        R3DJ_LAUNCH(norm_add_norm_kernel, (kMaxPer, 0,), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -360,6 +428,7 @@ int r3dh_rad_norm_add_norm_bf16(const RadArgs* a, RadStream stream) {
  * q is int8 */
 static int norm_add_norm_route(const RadArgs* a, RadStream stream, bool i8) {
     using namespace r3dh_join;
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     if (!a || a->n_t < 10) return RAD_E_INVAL;
     int64_t n = 0;
     float eps = 0.0f;
@@ -392,17 +461,20 @@ static int norm_add_norm_route(const RadArgs* a, RadStream stream, bool i8) {
     P.mult = (float)rad_args_getf_or(a, "mult", 1.0);
     P.n = (int)n; P.eps = eps;
     const bool narrow = n <= (int64_t)kThreads * 12;
-    if (narrow && i8)
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<12, 2>), dim3((unsigned)M), dim3(kThreads),
+    if (!i8 && M <= 64 && n <= (int64_t)kWide * 3)
+        R3DJ_LAUNCH_W(norm_add_norm_kernel, (3, 1,), dim3((unsigned)M), dim3(kWide),
+                      (hipStream_t)stream, P);
+    else if (narrow && i8)
+        R3DJ_LAUNCH(norm_add_norm_kernel, (12, 2,), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else if (narrow)
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<12, 1>), dim3((unsigned)M), dim3(kThreads),
+        R3DJ_LAUNCH(norm_add_norm_kernel, (12, 1,), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else if (i8)
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<kMaxPer, 2>), dim3((unsigned)M),
+        R3DJ_LAUNCH(norm_add_norm_kernel, (kMaxPer, 2,), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     else
-        R3DH_KLAUNCH(R3DH_KNAME(norm_add_norm_kernel<kMaxPer, 1>), dim3((unsigned)M),
+        R3DJ_LAUNCH(norm_add_norm_kernel, (kMaxPer, 1,), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
@@ -419,6 +491,7 @@ int r3dh_rad_norm_add_norm_route_i8g_bf16(const RadArgs* a, RadStream stream) {
 /* operands: d, w_d, r, w_r, w_j, x (inout), s, w_n?, y? -- the last two both or neither */
 int r3dh_rad_join_add_scale_bf16(const RadArgs* a, RadStream stream) {
     using namespace r3dh_join;
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     if (!a || a->n_t < 7) return RAD_E_INVAL;
     int64_t n = 0;
     float eps = 0.0f;
@@ -449,17 +522,24 @@ int r3dh_rad_join_add_scale_bf16(const RadArgs* a, RadStream stream) {
     if (Y) { P.w3 = (const float*)Wn->data; P.y = (uint16_t*)Y->data; P.y_ld = ly; }
     P.n = (int)n; P.eps = eps;
     const bool narrow = n <= (int64_t)kThreads * 12;
-    if (narrow && Y)
-        R3DH_KLAUNCH(R3DH_KNAME(join_add_scale_kernel<12, true>), dim3((unsigned)M), dim3(kThreads),
+    if (M <= 64 && n <= (int64_t)kWide * 3) {
+        if (Y)
+            R3DJ_LAUNCH_W(join_add_scale_kernel, (3, true,), dim3((unsigned)M), dim3(kWide),
+                          (hipStream_t)stream, P);
+        else
+            R3DJ_LAUNCH_W(join_add_scale_kernel, (3, false,), dim3((unsigned)M), dim3(kWide),
+                          (hipStream_t)stream, P);
+    } else if (narrow && Y)
+        R3DJ_LAUNCH(join_add_scale_kernel, (12, true,), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else if (narrow)
-        R3DH_KLAUNCH(R3DH_KNAME(join_add_scale_kernel<12, false>), dim3((unsigned)M), dim3(kThreads),
+        R3DJ_LAUNCH(join_add_scale_kernel, (12, false,), dim3((unsigned)M), dim3(kThreads),
                    (hipStream_t)stream, P);
     else if (Y)
-        R3DH_KLAUNCH(R3DH_KNAME(join_add_scale_kernel<kMaxPer, true>), dim3((unsigned)M),
+        R3DJ_LAUNCH(join_add_scale_kernel, (kMaxPer, true,), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     else
-        R3DH_KLAUNCH(R3DH_KNAME(join_add_scale_kernel<kMaxPer, false>), dim3((unsigned)M),
+        R3DJ_LAUNCH(join_add_scale_kernel, (kMaxPer, false,), dim3((unsigned)M),
                    dim3(kThreads), (hipStream_t)stream, P);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
