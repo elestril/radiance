@@ -3829,6 +3829,121 @@ static void check_attn_depth() {
 #endif
 }
 
+/* ---- the h128 gqa4 window row, both of its kernels, by value -------------------------------------
+ * attn_window_h128_gqa4_bf16kv (Mistral Nemo's attention) is two kernels behind one entry, and the
+ * row's own case (one query row over one key, from its constraints) reaches neither of them as a
+ * model runs it. These geometries do, by the shim's law (launch_attn in
+ * r3dh_attn_paged_window.hip):
+ *   - a decode step, one query row over 1,531 keys, with the row's scratch: two (tile, KV head)
+ *     pairs, so the scalar kernel cuts the key range into splits and the merge kernel joins their
+ *     partials;
+ *   - a prefill-shaped step of 96 rows (the WMMA kernel takes a step from 64 rows on): two query
+ *     tiles, the second partly filled, over the keys behind the chunk and the chunk's own.
+ * Each runs full causal and under a window, the prefill step also non-causal under a window (the
+ * window then bounds the keys on both sides). The context does not end on a block and the block
+ * table is a permutation. The reference is a host mirror of libref's attn_paged, scores and sums
+ * in double, as check_attn_depth's. */
+static void check_attn_window_h128() {
+    std::printf("== attn_window_h128_gqa4_bf16kv, the split-KV decode and the WMMA prefill, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: attention is not run");
+#else
+    using namespace moenum;
+    const RadKernelInfo* k = nullptr;
+    for (int i = 0; i < rows(); ++i)
+        if (row_at(i) && !std::strcmp(row_at(i)->name, "attn_window_h128_gqa4_bf16kv")) k = row_at(i);
+    if (!k || !k->launch) { fail("attn_window_h128_gqa4_bf16kv is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    const long long hd = 128, gqa = 4, kvh = 2, nh = kvh * gqa, bs = 16, ctx = 1531;
+    const long long nb = (ctx + bs - 1) / bs;
+    const double scale = 1.0 / std::sqrt((double)hd);
+    uint32_t seed = 0x7A3C91Du;
+    auto draw = [&](float amp) {
+        seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+        return amp * ((float)(seed & 0xffff) / 32768.0f - 1.0f);
+    };
+    std::vector<uint16_t> kv((size_t)(nb * kvh * bs * 2 * hd));
+    for (long long i = 0; i < (long long)kv.size(); ++i)
+        kv[(size_t)i] = f32_to_bf16(draw((i / hd) % 2 ? 2.0f : 1.5f));                 /* K then V a slot */
+    std::vector<int32_t> bt((size_t)nb), su = { (int32_t)ctx };
+    for (long long b = 0; b < nb; ++b) bt[(size_t)b] = (int32_t)((b * 37 + 5) % nb);   /* a permutation */
+    const struct { long long q_len, causal, window; } cases[] = {
+        { 1, 1, 0 }, { 1, 1, 700 }, { 96, 1, 0 }, { 96, 1, 200 }, { 96, 0, 200 } };
+    for (const auto& cs : cases) {
+        const long long M = cs.q_len;
+        std::vector<uint16_t> q((size_t)(M * nh * hd));
+        for (auto& v : q) v = f32_to_bf16(draw(1.5f));
+        std::vector<RadParam> p = { pi("q_len", M), pi("head_dim", hd), pi("gqa", gqa),
+                                    pi("block_size", bs), pi("causal", cs.causal),
+                                    pi("window", cs.window), pi("n_head", nh), pi("max_seqs", 1),
+                                    pi("max_ctx", nb * bs), ps("q_dtype", "bf16"),
+                                    ps("kv_dtype", "bf16") };
+        /* The host mirror: row m sits at position ctx - M + m. */
+        std::vector<double> ref((size_t)(M * nh * hd));
+        for (long long m = 0; m < M; ++m) {
+            const long long pos = ctx - M + m;
+            long long j0 = 0, j1 = cs.causal ? pos + 1 : ctx;
+            if (cs.window > 0) {
+                j0 = std::max(0LL, pos - cs.window + 1);
+                if (!cs.causal) j1 = std::min(ctx, pos + cs.window);
+            }
+            for (long long h = 0; h < nh; ++h) {
+                const uint16_t* qr = q.data() + (m * nh + h) * hd;
+                auto slot = [&](long long j) {
+                    return kv.data() + ((bt[(size_t)(j / bs)] * kvh + h / gqa) * bs + j % bs) * 2 * hd;
+                };
+                std::vector<double> sc((size_t)ctx, 0.0), acc((size_t)hd, 0.0);
+                double mx = -1e300, sum = 0;
+                for (long long j = j0; j < j1; ++j) {
+                    double d = 0;
+                    for (long long e = 0; e < hd; ++e)
+                        d += (double)bf16_to_f32(qr[e]) * (double)bf16_to_f32(slot(j)[e]);
+                    sc[(size_t)j] = d * scale;
+                    mx = std::max(mx, sc[(size_t)j]);
+                }
+                for (long long j = j0; j < j1; ++j) {
+                    const double w = std::exp(sc[(size_t)j] - mx);
+                    sum += w;
+                    for (long long e = 0; e < hd; ++e) acc[(size_t)e] += w * (double)bf16_to_f32(slot(j)[hd + e]);
+                }
+                for (long long e = 0; e < hd; ++e) ref[(size_t)((m * nh + h) * hd + e)] = acc[(size_t)e] / sum;
+            }
+        }
+        Dev dv;
+        RadTensor t[8] = {};
+        t[0].data = dv.put(q.data(), q.size() * 2); t[0].dtype = RAD_BF16; t[0].rank = 3;
+        t[0].shape[0] = M; t[0].shape[1] = nh; t[0].shape[2] = hd;
+        t[0].stride[0] = nh * hd; t[0].stride[1] = hd; t[0].stride[2] = 1;
+        t[7] = t[0]; t[7].data = dv.put(nullptr, q.size() * 2);
+        t[1].data = dv.put(kv.data(), kv.size() * 2); t[1].dtype = RAD_BF16; t[1].rank = 4;
+        t[1].shape[0] = nb; t[1].shape[1] = kvh; t[1].shape[2] = bs; t[1].shape[3] = 2 * hd;
+        t[1].stride[0] = kvh * bs * 2 * hd; t[1].stride[1] = bs * 2 * hd; t[1].stride[2] = 2 * hd;
+        t[1].stride[3] = 1;
+        t[2] = dense(dv.put(bt.data(), bt.size() * 4), RAD_I32, 1, nb);
+        t[3] = vec(dv.put(su.data(), 4), RAD_I32, 1);
+        RadArgs a{ t, 8, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        /* The builder's call for the scratch: params, no tensors. */
+        RadArgs pa{ nullptr, 0, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const long long bytes = k->scratch ? (long long)k->scratch(&pa) : 0;
+        if (bytes > 0) { a.scratch = dv.put(nullptr, (size_t)bytes); a.scratch_bytes = bytes; }
+        char what[128];
+        std::snprintf(what, sizeof(what), "attn_window_h128_gqa4, %s, q_len %lld over %lld keys, %s, "
+                      "window %lld", M >= 64 ? "WMMA" : "split-KV", M, ctx,
+                      cs.causal ? "causal" : "non-causal", cs.window);
+        if (M < 64 && bytes <= 0) { fail("%s: the scratch hook gives no bytes, so nothing is split", what);
+                                    continue; }
+        const int rc = k->launch(&a, nullptr);
+        if (hipDeviceSynchronize() != hipSuccess) { fail("%s: the kernel faulted", what); continue; }
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> got(q.size());
+        if (hipMemcpy(got.data(), t[7].data, got.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+            fail("%s: copying the output back failed", what); continue; }
+        compare(what, ref, got, 2e-3);
+    }
+#endif
+}
+
 /* ---- the int8 trunk, by value -------------------------------------------------------------------
  * had_quant_act_i8g and gemm_nt_q at i8a8 against host mirrors of libref's arithmetic
  * (had_quant_act_q8 / q8_group, quant_dot). The quantiser's scale must be amax / 127 of the
@@ -4320,6 +4435,7 @@ int main(int argc, char** argv) {
         check_conv_numerics();
         check_rope_numerics();
     check_attn_depth();
+        check_attn_window_h128();
         check_i8a8_numerics();
         check_gated_had_quant_numerics();
         check_gemm_device_weight();
