@@ -70,8 +70,6 @@ namespace {
 
 constexpr int kBlockThreads = 256;           // eight waves, the default
 constexpr int kWaves        = kBlockThreads / kWave;
-constexpr int kKTile        = 128;           // k a staged tile covers, eight wmma steps
-constexpr int kAPitch       = kKTile / 2 + 4;   // dwords a staged a row, the dot2 arm's 68
 constexpr int kUnit         = 16;            // k a wmma step consumes: a slab's law
 
 
@@ -94,14 +92,11 @@ __device__ __forceinline__ r3d_u32x4 ldw(const uint16_t* p)
  * narrowed bf16 the caller asked for. With sk > 1 every split writes its own f32 partial,
  * dense [sk][M][N], and the reducer adds them in split order. */
 template <bool NT, bool SPLIT>
-__global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_m16_wmma_kernel(
+__global__ __launch_bounds__(kBlockThreads) R3D_WAVES(5) void gemm_m16_wmma_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Part,
     int M, int N, int K, int a_ld, int y_ld, int w_ld, int kslab)
 {
-    /* Staged activation in the checkpoint's own bytes, a dword array at the dot2 arm's pitch. */
-    __shared__ uint32_t s_a[16 * kAPitch];
-
     const uint32_t tid  = threadIdx.x;
     const uint32_t lane = tid & (kWave - 1);
     const uint32_t wave = tid / kWave;
@@ -117,49 +112,50 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_m16_wmma_kern
     const uint16_t* w = B + (size_t)n_real * w_ld;
     v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
 
-    for (int kt = kbeg; kt < kend; kt += kKTile) {
-        const int kl = std::min(kKTile, kend - kt);
-
-        /* Stage 16 rows x kl bf16, eight elements a unit, 256 threads. A row past M re-reads
-         * the last real row, whose products the store drops; a unit past kl zero-fills. */
-        const int nu = (kl + 7) / 8;
-        for (int i = (int)tid; i < 16 * nu; i += (int)blockDim.x) {
-            const int row = i / nu, c = (i % nu) * 8;
-            const int rr = row < M ? row : M - 1;
-            const uint16_t* src = A + (size_t)rr * a_ld + kt + c;
-            uint32_t* dst = s_a + (size_t)row * kAPitch + c / 2;
-            if (c + 8 <= kl) {
-                const r3d_u32x4 q = *(const __attribute__((address_space(1))) r3d_u32x4*)src;
-                *(r3d_u32x4*)dst = q;
-            } else {
-                uint32_t p[4] = { 0, 0, 0, 0 };
-                for (int e = 0; e < kl - c; e += 2) {
-                    const uint32_t lo = ldg_u16(src + e);
-                    const uint32_t hi = (e + 1 < kl - c) ? ldg_u16(src + e + 1) : 0u;
-                    p[e / 2] = lo | (hi << 16);
-                }
-                for (int e = 0; e < (kl - c + 1) / 2; ++e) dst[e] = p[e];
-            }
+    /* The activation fragment comes straight from global (16 rows of at most a few KiB, read
+     * by every wave, so the caches serve it) and the weight four steps ahead of its wmma: no LDS
+     * stage and no barrier between the steps. The wmma sequence is the staged form's -- the same
+     * fragments in ascending k -- so the output is the same bytes. K is a multiple of 16 (the
+     * launcher refuses the rest), so every fragment read is whole. */
+    const int rr = (int)r < M ? (int)r : M - 1;
+    const uint16_t* arow = A + (size_t)rr * a_ld;
+    constexpr int U = 8;
+    int k = kbeg;
+    for (; k + 16 * U <= kend; k += 16 * U) {
+        r3d_u32x4 a0[U], a1[U], b0[U], b1[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            b0[u] = ldw<NT>(w + k + 16 * u);
+            b1[u] = ldw<NT>(w + k + 16 * u + 8);
         }
-        group_barrier();
-
-        const uint32_t* ap = s_a + (size_t)r * kAPitch;
-        for (int k = 0; k < kl; k += 16) {
-            /* Eight wmma steps per tile: two 16-byte reads a lane, the row's k pair at
-             * dword k/2 and k/2 + 4, and the column's from global. */
-            const r3d_u32x4 a0 = *(const r3d_u32x4*)(ap + k / 2);
-            const r3d_u32x4 a1 = *(const r3d_u32x4*)(ap + k / 2 + 4);
-            const r3d_u32x4 b0 = ldw<NT>(w + kt + k);
-            const r3d_u32x4 b1 = ldw<NT>(w + kt + k + 8);
-            const v16short fa = v16short{ R3D_U16(a0.x), R3D_U16(a0.y), R3D_U16(a0.z),
-                                          R3D_U16(a0.w), R3D_U16(a1.x), R3D_U16(a1.y),
-                                          R3D_U16(a1.z), R3D_U16(a1.w) };
-            const v16short fb = v16short{ R3D_U16(b0.x), R3D_U16(b0.y), R3D_U16(b0.z),
-                                          R3D_U16(b0.w), R3D_U16(b1.x), R3D_U16(b1.y),
-                                          R3D_U16(b1.z), R3D_U16(b1.w) };
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            a0[u] = *(const __attribute__((address_space(1))) r3d_u32x4*)(arow + k + 16 * u);
+            a1[u] = *(const __attribute__((address_space(1))) r3d_u32x4*)(arow + k + 16 * u + 8);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const v16short fa = v16short{ R3D_U16(a0[u].x), R3D_U16(a0[u].y), R3D_U16(a0[u].z),
+                                          R3D_U16(a0[u].w), R3D_U16(a1[u].x), R3D_U16(a1[u].y),
+                                          R3D_U16(a1[u].z), R3D_U16(a1[u].w) };
+            const v16short fb = v16short{ R3D_U16(b0[u].x), R3D_U16(b0[u].y), R3D_U16(b0[u].z),
+                                          R3D_U16(b0[u].w), R3D_U16(b1[u].x), R3D_U16(b1[u].y),
+                                          R3D_U16(b1[u].z), R3D_U16(b1[u].w) };
             acc = wmma_bf16(fa, fb, acc);
         }
-        group_barrier();                      // the next tile's stage must not race this one's reads
+    }
+    for (; k < kend; k += 16) {
+        const r3d_u32x4 a0 = *(const __attribute__((address_space(1))) r3d_u32x4*)(arow + k);
+        const r3d_u32x4 a1 = *(const __attribute__((address_space(1))) r3d_u32x4*)(arow + k + 8);
+        const r3d_u32x4 b0 = ldw<NT>(w + k);
+        const r3d_u32x4 b1 = ldw<NT>(w + k + 8);
+        const v16short fa = v16short{ R3D_U16(a0.x), R3D_U16(a0.y), R3D_U16(a0.z),
+                                      R3D_U16(a0.w), R3D_U16(a1.x), R3D_U16(a1.y),
+                                      R3D_U16(a1.z), R3D_U16(a1.w) };
+        const v16short fb = v16short{ R3D_U16(b0.x), R3D_U16(b0.y), R3D_U16(b0.z),
+                                      R3D_U16(b0.w), R3D_U16(b1.x), R3D_U16(b1.y),
+                                      R3D_U16(b1.z), R3D_U16(b1.w) };
+        acc = wmma_bf16(fa, fb, acc);
     }
 
     const bool keep = (n0 < (uint32_t)N);
