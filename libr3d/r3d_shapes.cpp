@@ -1064,3 +1064,31 @@ extern "C" int r3d_shape_logit_softcap(const RadParam* p, int n_p, int operand, 
     const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n) };
     R3D_PICK(list);
 }
+
+/* The fused router (r3dh_router_gemm_scatter.hip), libref's description: the router GEMM's
+ * operands, then router_topk_scatter's with `logits` named once as the GEMM's output, and the
+ * shared expert's one-column gate, which the row launches beside the router when both `gate_b`
+ * and `gate` are passed. A `top_k` past `n_expert` or an `n_local` past it is no routing, so it
+ * declines, as libref does. */
+extern "C" int r3d_shape_router_gemm_topk_scatter(const RadParam* p, int n_p, int operand,
+                                                  RadOpdDesc* out) {
+    const int64_t M  = gi(p, n_p, "M", 0), K = gi(p, n_p, "K", 0);
+    const int64_t ne = gi(p, n_p, "n_expert", 0), k = gi(p, n_p, "top_k", 0);
+    const int64_t nl = gi(p, n_p, "n_local", ne);
+    if (M <= 0 || K <= 0 || ne <= 0 || k <= 0 || k > ne || nl <= 0 || nl > ne)
+        return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const RadOpdDesc list[] = {
+        opd(D, M, K),                                         /* a */
+        opd(D, ne, K),                                        /* b: the router */
+        opd(D, 1, K),                                         /* gate_b: the shared expert's gate */
+        opd(D, M, ne),                                        /* logits */
+        opd((uint32_t)RAD_I32, M, k),                         /* expert_ids */
+        opd(D, M, k),                                         /* expert_w */
+        opd((uint32_t)RAD_I32, M * k),                        /* sorted_tok */
+        opd((uint32_t)RAD_I32, nl + 1),                       /* expert_offset */
+        opd((uint32_t)RAD_I32, nl),                           /* expert_count */
+        opd(D, M, 1),                                         /* gate */
+    };
+    R3D_PICK(list);
+}

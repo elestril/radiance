@@ -185,6 +185,8 @@ set(R3D_UNITS
   "r3dh_attn_paged_window|"
   "r3dh_encoder_bf16|"
   "r3dh_elem_bf16|"
+  # The MoE router's GEMM, top-k and sort in one launch at decode heights (Gemma 4).
+  "r3dh_router_gemm_scatter|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )

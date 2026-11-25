@@ -687,6 +687,16 @@ static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"
 static const RadOperandSpec oMulWeight[] = { { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 },
                                              { "y", RAD_OPD_OUT, 0 } };
 static const RadParamSpec pMnCap[] = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
+static const RadParamSpec pRouterGemmTopkScatter[] = { P_INT("M"), P_INT("K"),
+                                                       P_INT("n_expert"), P_INTO("n_local"),
+                                                       P_INT("top_k"), P_INT("norm"),
+                                                       P_STR("dtype"), P_INTO("expert_base"),
+                                                       P_STRO("protect") };
+static const RadOperandSpec oRouterGemmTopkScatter[] = {
+    { "a", RAD_OPD_IN, 0 }, { "b", RAD_OPD_WEIGHT, 0 }, { "gate_b", RAD_OPD_WEIGHT, 1 },
+    { "logits", RAD_OPD_OUT, 0 }, { "expert_ids", RAD_OPD_OUT, 0 }, { "expert_w", RAD_OPD_OUT, 0 },
+    { "sorted_tok", RAD_OPD_OUT, 0 }, { "expert_offset", RAD_OPD_OUT, 0 },
+    { "expert_count", RAD_OPD_OUT, 0 }, { "gate", RAD_OPD_OUT, 1 } };
 
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
@@ -1021,6 +1031,15 @@ static const RadOpSchema kSchemas[] = {
     SCHEMA("gelu_mul", pMnDtype, oGateUp,
            "y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], the tanh approximation, the gate the "
            "first half as in silu_mul."),
+    SCHEMA("router_gemm_topk_scatter", pRouterGemmTopkScatter, oRouterGemmTopkScatter,
+           "`gemm_nt` of `a` against the router `b`, then `router_topk_scatter` over those logits, and "
+           "with `gate_b`/`gate` present the shared expert's `gemm_nt` at N = 1 over the same `a`."),
+    SCHEMA("attn_paged_ahead", pAttnPaged, oAttnPaged,
+           "attn_paged, non-causal, with `window` (> 0) bounding the keys behind a row only: key j is "
+           "visible when pos - j < window, every later key of the sequence is. A sliding layer's mask "
+           "over a picture's rows read both ways."),
+    SCHEMA("attn_paged_qrow_ahead", pAttnPaged, oAttnPaged,
+           "attn_paged_ahead with q read at its own row pitch, as attn_paged_qrow."),
     SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row (the q part of a fused [q|k|v] projection)."),
@@ -1716,6 +1735,11 @@ extern "C" int r3dh_rad_rmsnorm_p(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gelu_mul(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h512_gqa16_bf16(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_ahead_h256_gqa2_bf16(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, int, void**);
+extern "C" void r3dh_rad_router_gemm_topk_scatter_fini(void* inst);
 extern "C" int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs* a);
 extern "C" int64_t r3dh_rad_attn_window_h512_scratch(const RadArgs* a);
 
@@ -1746,6 +1770,24 @@ static const RadConstraint cWinH512G8Bf16[] = { C_EQ("head_dim", 512), C_EQ("gqa
                                                 C_EQ("block_size", 16), C_GE("causal", 0),
                                                 C_GE("window", 0), C_IN("q_dtype", "bf16"),
                                                 C_IN("kv_dtype", "bf16") };
+/* The fused router: the decode band (M <= 64), K in 16s. The sort's single-workgroup form takes
+ * M * top_k <= 1024 slots (kScatterSmall), and a product is not a constraint, so the factors are
+ * bound instead: 64 rows by top_k <= 16 keeps every pair inside it. The shim's own bound is the
+ * product (it takes top_k up to 32 at 32 rows or fewer); the rows are the factor kept whole,
+ * because they are the skinny GEMM's decode band, which an architecture asks for as one range. */
+static const RadConstraint cRouterGemmTopkScatter[] = { C_GE("M", 1), C_LE("M", 64), C_DIV("K", 16),
+                                                        C_GE("n_expert", 1), C_LE("n_expert", 512),
+                                                        C_GE("top_k", 1), C_LE("top_k", 16),
+                                                        C_IN("dtype", "bf16") };
+/* The open-ended window (attn_paged_ahead): non-causal, a window of at least one. */
+static const RadConstraint cWinAheadH256G2Bf16[] = { C_EQ("head_dim", 256), C_EQ("gqa", 2),
+                                                     C_EQ("block_size", 16), C_EQ("causal", 0),
+                                                     C_GE("window", 1), C_IN("q_dtype", "bf16"),
+                                                     C_IN("kv_dtype", "bf16") };
+static const RadConstraint cWinH512G16Bf16[] = { C_EQ("head_dim", 512), C_EQ("gqa", 16),
+                                                 C_EQ("block_size", 16), C_GE("causal", 0),
+                                                 C_GE("window", 0), C_IN("q_dtype", "bf16"),
+                                                 C_IN("kv_dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
 #ifdef R3D_DENSE_IQR
@@ -3468,6 +3510,44 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r3dh_rad_gelu_mul, nullptr, nullptr, nullptr, r3d_shape_silu_mul },
+{ "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
+  "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
+  "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",
+  "M <= 64 and top_k <= 16, so that M*top_k <= 1024 at every pair (the sort's bound is the "
+  "product, which no constraint states); n_expert <= 512, top_k <= n_expert; K a multiple of "
+  "16 times the split the bf16 skinny GEMM's law picks",
+  "bf16 activation and weights, fp32 accumulate; bf16 logits, gate and weights, i32 ids, "
+  "sorted slots, offsets and counts out",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cRouterGemmTopkScatter), NOTUNE,
+  r3dh_rad_router_gemm_topk_scatter_init, r3dh_rad_router_gemm_topk_scatter_fini,
+  r3dh_rad_router_gemm_topk_scatter, nullptr, nullptr, nullptr,
+  r3d_shape_router_gemm_topk_scatter },
+{ "attn_ahead_h256_gqa2_bf16kv", "attn_paged_ahead", "attn",
+  "paged attention, non-causal, a window over the keys behind only",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query, bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinAheadH256G2Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_ahead_h256_gqa2_bf16, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_qrow_ahead_h256_gqa2_bf16kv", "attn_paged_qrow_ahead", "attn",
+  "paged attention reading q at its own row pitch, non-causal, a window over the keys behind only",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query (any row pitch), bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinAheadH256G2Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_ahead_h256_gqa2_bf16, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_window_h512_gqa16_bf16kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 512, 16 queries per kv head (Gemma 4 12B's full layers), paged block 16, any q_len, "
+  "varlen",
+  "bf16 query, bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G16Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa16_bf16, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
 { "attn_qrow_h512_gqa8_bf16kv", "attn_paged_qrow", "attn",
   "paged attention reading q at its own row pitch, any window, causal or not",
   "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen",

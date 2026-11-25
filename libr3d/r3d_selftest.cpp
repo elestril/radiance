@@ -479,6 +479,20 @@ static void check_shapes() {
         { "sample_ngram_ban", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_mask", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_logprobs", { PI("M", 2048), PI("n_vocab", 130560), PI("k", 21) } },
+        /* Gemma 4's sliding layers over a picture's rows, which read both ways: non-causal, the
+         * 1024-token window over the keys behind only; and the same with q read in place. */
+        { "attn_paged_ahead", { PI("q_len", 256), PI("head_dim", 256), PI("gqa", 2),
+                                PI("block_size", 16), PI("causal", 0), PI("window", 1024),
+                                PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"), PI("n_head", 16),
+                                PI("ctx", 4096), PI("max_ctx", 262144) } },
+        { "attn_paged_qrow_ahead", { PI("q_len", 256), PI("head_dim", 256), PI("gqa", 2),
+                                     PI("block_size", 16), PI("causal", 0), PI("window", 1024),
+                                     PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"),
+                                     PI("n_head", 16), PI("ctx", 4096), PI("max_ctx", 262144) } },
+        /* Gemma 4 26B-A4B's router at a decode step: 128 experts, eight a token, from a 2816-wide
+         * row. */
+        { "router_gemm_topk_scatter", { PI("M", 8), PI("K", 2816), PI("n_expert", 128),
+                                        PI("top_k", 8), PI("norm", 1), PS("dtype", "bf16") } },
         /* MiniCPM5-2B's speculative decoder band: a 7-token draft block, 16 candidates a step, a
          * rank-256 codebook over a 130560-token vocabulary (63.8 MiB each), anchors 7 apart. */
         { "dflash_select", { PI("M", 256), PI("steps", 7), PI("top_k", 16), PI("rank", 256),
@@ -2645,6 +2659,15 @@ launched:
         }
     }
 
+    /* The state a row keeps between launches, taken as the engine's declare takes it: once, with
+     * the geometry, before the first launch (the fused router's arrival counter). */
+    void* inst = nullptr;
+    if (k->init) {
+        const int irc = k->init(c.p, c.n_p, 0, 1, &inst);
+        if (irc != RAD_OK) { fail("init returned %d", irc); return 1; }
+        a.instance = inst;
+    }
+
     const int rc = k->launch(&a, nullptr);
     const hipError_t le = hipGetLastError();
     const int sync = (int)hipDeviceSynchronize();
@@ -2811,6 +2834,7 @@ launched:
         }
     }
 
+    if (k->fini) k->fini(inst);
     if (scratch) (void)hipFree(scratch);
     for (void* p : c.dev) {
         if (std::find(c.host.begin(), c.host.end(), p) != c.host.end()) (void)hipHostFree(p);

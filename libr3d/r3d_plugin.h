@@ -327,6 +327,7 @@ extern "C" int r3d_shape_qk_norm_rope      (const RadParam*, int, int, RadOpdDes
 extern "C" int r3d_shape_seg_mean          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_mul_weight        (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_logit_softcap     (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_router_gemm_topk_scatter(const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the
