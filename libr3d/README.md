@@ -480,9 +480,10 @@ are libhalo's, so the cases and recordings agree across the two:
 | `r3dh_norm_join_bf16.hip` | `norm_add_norm_bf16`, `norm_add_norm_route_bf16`, `norm_add_norm_route_i8g_bf16`, `join_add_scale_bf16` | Gemma 4's sandwich-norm joins, one launch for each post-norm / residual add / pre-norm chain the gemma4 plugin otherwise declares (with `r3dh_fwht.h` and the current `r3dh_q8.h`); the 26B-A4B's decode pass goes from 935 to 635 dispatches (RX 7900 XT). libref has no row for these ops |
 
 The headers they read (`r3dh_dt16.h`, `r3dh_attn_args.h`, `r3dh_chain.h`, `r3dh_launch.h`, and
-`R3dhArgs` in `r3dh.h`) are libhalo's under the same rename, except that `r3dh_chain.h`'s acquire
-also empties the GL1 from the scalar path on gfx10 and gfx11 (marked `libr3d:` in the source). The
-chained forms the units carry are never launched: no row here resolves with `chain`.
+`R3dhArgs` in `r3dh.h`) are libhalo's under the same rename. Their chained forms are launched
+where the row resolves with `chain` (below, "Chained launches"); libr3d adds chained forms and
+decode-height changes to `r3dh_encoder_bf16.hip`, `r3dh_elem_bf16.hip`, `r3dh_norm_join_bf16.hip`
+and `r3dh_chain.h` that libhalo does not have, each marked `libr3d:` in the source.
 
 Checked on an RX 7900 XT (gfx1100) with rad-kbench against libref on EmbeddingGemma 2's bands
 (`-m embeddinggemma2-bf16.rad --max-tok 2048`): every case passed, worst rel_l2 1.5e-3 (the two
@@ -679,10 +680,18 @@ pending asynchronous error first). Clear the flag after the arguments are staged
 launch, read it straight back, and on a refusal name the error and print the grid, block, waves,
 splits and width the launcher chose.
 
-**No collective rows and no chained forms.** The parts in this family are single-GPU, and an
-all-reduce over the host link most of them sit on is slower than sending the bytes through the
-host. Nothing here is built as a chained form, so both optional symbols are omitted, which is the
-ABI's own answer.
+**No collective rows.** The parts in this family are single-GPU, and an all-reduce over the host
+link most of them sit on is slower than sending the bytes through the host, so
+`rad_kernel_collective` is omitted, which is the ABI's own answer.
+
+**Chained launches.** `rad_kernel_chain` answers 2 for the rows of the Gemma 4 26B-A4B's decode
+pass (the list is in `r3d_rows.cpp`, matched by entry point): at 64 rows or fewer their entries
+launch the forms tagged `r4dchain`, which wait for the queue's counter in their prologue and add
+to it after their last write (`r3d_chain.h`, a scope guard over `r3dh_chain.h`'s wait and add;
+the wait empties the scalar data cache too, hence 2). The wait polls by grid size as libr4d's
+does. The bf16 GEMM's dot2 arm, the f32 norm and the prefill kernels stay plain. On an RX 7900
+XT a dependent launch behind the barrier bit starts a median 3.2 us after the one in front;
+chained, the 26B-A4B's pass went from 1.38 ms idle to 0.27 ms.
 
 **A decode step's small kernels are bound by their instruction fetch.** In a 26B-A4B decode pass
 a one-block kernel's code is cold (the weight stream evicts it between layers), and on an RX 7900

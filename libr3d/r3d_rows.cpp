@@ -3760,10 +3760,7 @@ static const RadKernelInfo kKernels[] = {
  * The two exports every plugin needs, the four that make a kernel library, and
  * `rad_kernel_concurrent`.
  *
- * No `rad_kernel_chain`: chaining replaces the queue's ordering between two dependent launches with
- * a spin in the kernel, and no row here has a chained form, so every answer would be 0. Omitting the
- * symbol means the same (ABI, `rad_kernel_chain`: "without the symbol, or with 0, the engine never
- * asks").
+ * `rad_kernel_chain` names the rows whose entries launch chained forms (below).
  *
  * No `rad_kernel_collective`: these rows run on single-GPU cards, and an all-reduce over the PCIe x1
  * slot most of them sit in is slower than going through the host.
@@ -3791,6 +3788,39 @@ extern "C" int rad_kernel_concurrent(int i) {
     const RadKernelInfo* k = rad_kernel_at(i);
     if (!k) return 0;
     return k->scratch == nullptr;
+}
+
+/* Which rows launch chained forms (RadKernelChainFn): their entries read the `chain` parameter
+ * and, at decode heights (r3dh_chain_small, r3d_chain_rows: 64 rows or fewer), launch the kernels
+ * tagged r4dchain (r3d_chain.h, r3dh_chain.h); a launch at a prefill height stays plain. Every
+ * such form waits through r3dh_chain_wait, whose acquire empties the scalar data cache as well as
+ * the vector caches, so each answers 2 (the packets may go without the packet processor's
+ * acquire).
+ *
+ * The set is the Gemma 4 26B-A4B's decode pass, every launch of it: the embedding, the norms,
+ * the bf16 GEMM's wave-matrix arm (its dot2 arm stays plain), q/k/v norm and rotary, the cache
+ * store, the windowed attention and its merge, the sandwich-norm joins, the router, the expert
+ * scale, the E4M3 expert GEMV, the activation product and quantiser, the routed gather, the
+ * sampled rows' gather, the head's one-row arm and the soft-cap. A row is matched by its entry,
+ * so every row an entry serves is in or out together. */
+extern "C" int rad_kernel_chain(int i) {
+    const RadKernelInfo* k = rad_kernel_at(i);
+    if (!k || k->domain != RAD_DOMAIN_DEVICE) return 0;
+    static const RadLaunchFn kChained[] = {
+        r3d_rad_embed_lookup, r3d_rad_rmsnorm, r3d_rad_rope, r3d_rad_kv_store, r3d_rad_gather_rows,
+        r3d_rad_gemm_nt_bf16_m16, r3dh_rad_qk_norm_rope, r3dh_rad_act_mul, r3dh_rad_logit_softcap,
+        r3dh_rad_attn_window_h256_gqa2_bf16, r3dh_rad_attn_window_h512_gqa8_bf16,
+        r3dh_rad_attn_window_h512_gqa16_bf16, r3dh_rad_attn_window_ahead_h256_gqa2_bf16,
+        r3dh_rad_attn_window_h256_gqa2_i8, r3dh_rad_attn_window_h512_gqa8_i8,
+        r3dh_rad_attn_window_h512_gqa16_i8,
+        r3dh_rad_norm_add_norm_bf16, r3dh_rad_norm_add_norm_route_bf16,
+        r3dh_rad_norm_add_norm_route_i8g_bf16, r3dh_rad_join_add_scale_bf16,
+        r3dh_rad_router_gemm_topk_scatter, r3d_rad_expert_scale_bf16, r3d_rad_moe_gemm_w4a8,
+        r3d_rad_quant_act_fp8, r3d_rad_moe_gather, r3d_rad_logits_gemm_bf16,
+    };
+    for (RadLaunchFn f : kChained)
+        if (k->launch == f) return 2;
+    return 0;
 }
 
 static const RadPluginInfo kInfo = {
