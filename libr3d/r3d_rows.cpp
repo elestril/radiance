@@ -1309,8 +1309,11 @@ static const RadConstraint cFillI64[]  = { C_IN("dtype", "i64") };
  * `rotary_dim` cannot be constrained: it is optional, a constraint on a key the band does not carry
  * does not hold (see r3d_selftest.cpp's band-reachability phase), and llama-family graphs, which
  * rotate the whole head, omit it. The shim refuses an odd rotary_dim (RAD_E_SHAPE); absent, it is
- * head_dim, which the constraint keeps even. */
-static const RadConstraint cRope[] = { C_IN("mode", "neox gptj"), C_DIV("head_dim", 2) };
+ * head_dim, which the constraint keeps even. The kernel holds a row's ladder in LDS, 512 pairs of
+ * it; rotary_dim is at most head_dim, so the row states the limit on head_dim (the launcher
+ * checks the rotary width itself). */
+static const RadConstraint cRope[] = { C_IN("mode", "neox gptj"), C_DIV("head_dim", 2),
+                                       C_LE("head_dim", 1024) };
 
 /* The cache's dtype is the row: a bf16 cache stores the value, an E4M3 cache encodes it with the
  * store's scale. head_dim even because a lane writes a pair; block_size a multiple of 16 so a
@@ -1867,9 +1870,9 @@ static const RadKernelInfo kKernels[] = {
 
 { "rope_bf16", "rope", "attn",
   "rotary positions applied in place to a fused qkv row, neox and gptj pair layouts",
-  "head_dim even; rotary_dim optional and even, defaulting to head_dim; the `rotary` and the "
-  "proportional `head` ladder; a wave a head; the angles from accurate powf and sincosf, the "
-  "position divided by `scale`",
+  "head_dim even, at most 1024; rotary_dim optional and even, defaulting to head_dim; the "
+  "`rotary` and the proportional `head` ladder; a wave a head; the angles from accurate powf and "
+  "sincosf, the position divided by `scale`",
   "bf16 qkv in place, i32 positions, fp32 angles",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cRope), NOTUNE,
@@ -1878,8 +1881,9 @@ static const RadKernelInfo kKernels[] = {
 /* rope under its row-form name (libr4d's rope_rows): the same launch. */
 { "rope_rows_bf16", "rope_rows", "attn",
   "rotary positions applied in place, one thread a rotated pair, under its row-form name",
-  "head_dim even; rotary_dim optional and even; the `rotary` and the proportional `head` ladder "
-  "(LFM3's partial rotary on its full layers); neox and gptj pairings; byte-identical to rope",
+  "head_dim even, at most 1024; rotary_dim optional and even; the `rotary` and the proportional "
+  "`head` ladder (LFM3's partial rotary on its full layers); neox and gptj pairings; "
+  "byte-identical to rope",
   "bf16 qkv in place, i32 positions, fp32 angles",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cRope), NOTUNE,

@@ -676,8 +676,11 @@ __global__ __launch_bounds__(THR) void rope_kernel(
     const uint32_t total = n_rope_heads * half;
     uint16_t* __restrict__ row = qkv + (size_t)m * row_pitch;
 
-    for (uint32_t j = threadIdx.x; j < total; j += THR) {
-        const uint32_t h = j / half, i = j - h * half;
+    /* A pair's angle is the same in every head, so its cos and sin are computed once a row into
+     * LDS (half <= 512: head_dim at most 1024), not once a head: the double pow runs at 1:64 on
+     * gfx11, and at 32 heads it was most of the launch. The values are the per-head loop's. */
+    __shared__ float s_cos[512], s_sin[512];
+    for (uint32_t i = threadIdx.x; i < half; i += THR) {
         /* ref's ladder: `1.0f / ref_pow(theta, (float)(2i) / den)`, with ref_pow the double pow
          * narrowed once. powf would put the reciprocal a ULP off, and at position 262144 a ULP of a
          * frequency is about 0.01 rad of rotation, so the ladder is computed in double. The angle
@@ -688,8 +691,14 @@ __global__ __launch_bounds__(THR) void rope_kernel(
                              (int)i);
         float s, c;
         sincosf(p * inv, &s, &c);
-        c *= yarn.magnitude;
-        s *= yarn.magnitude;
+        s_cos[i] = c * yarn.magnitude;
+        s_sin[i] = s * yarn.magnitude;
+    }
+    __syncthreads();
+
+    for (uint32_t j = threadIdx.x; j < total; j += THR) {
+        const uint32_t h = j / half, i = j - h * half;
+        const float c = s_cos[i], s = s_sin[i];
         const uint32_t i0 = h * head_dim + (GPTJ ? 2u * i : i);
         const uint32_t i1 = h * head_dim + (GPTJ ? 2u * i + 1u : i + half);
         const float x0 = bf16_to_f32(ldg_u16_at(row, i0));
@@ -1279,6 +1288,7 @@ extern "C" int r3d_rope_bf16(long qkv, long pos, int M, int head_dim, int n_head
      * widens it; the frequencies past rotary_dim/2 stay zero. */
     const int nfreq = rot / 2;
     if (den == head_dim && rot < head_dim && mode == R3D_ROPE_NEOX) rot = head_dim;
+    if (rot > 1024) return -3;                         // the kernel's LDS ladder holds 512 pairs
     RadYarn yarn{};
     if (yarn_factor != 0.0f) yarn = { yarn_factor, yarn_low, yarn_high, yarn_magnitude };
     if (!rad_yarn_valid(yarn)) return -2;
