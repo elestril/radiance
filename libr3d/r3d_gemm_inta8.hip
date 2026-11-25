@@ -1,5 +1,6 @@
-/* r3d_gemm_inta8.hip -- gemm_nt_q at dtype=w4a8 and w8a8: the symmetric int4 and int8 weight
- * grids at decode heights, one kernel per grid.
+/* r3d_gemm_inta8.hip -- gemm_nt_q at dtype=w8a8: the symmetric int8 weight grid at decode
+ * heights. The kernel also has an arm for the symmetric int4 grid, which no row launches: the
+ * w4a8 grid is gemm_w4a8_nt_m64's (r3dh_gemm_w4a8_nt_m64.hip).
  *
  * The grids (libref's descriptions): int8 activations in quant_act_i8's step order with an f32
  * scale per row, against signed weight codes (I4 two per byte, or I8) with one f16 scale per
@@ -243,38 +244,6 @@ int mt_for(int M)
                     (int)sb_rb, (uint16_t*)y, M, N, K, chunk, a_ld, y_ld);                                          \
     } while (0)
 
-extern "C" int r3d_gemm_nt_q_w4a8_m16(long a, long a_scale, long b, long b_scale, long y,
-                                      int M, int N, int K, int a_ld, int y_ld, long long b_rb,
-                                      long long sb_rb, long stream)
-{
-    if (!a || !a_scale || !b || !b_scale || !y) return -1;
-    if (M < 1 || N < 1 || K < 1) return -2;
-    if (M > kMTMax) return -2;
-    if (K % kGroup) return -2;
-    const int mt = mt_for(M);
-    const int chunk = 2048 / mt;
-    if (K % chunk) return -2;
-    if (!a_ld) a_ld = K;
-    if (!y_ld) y_ld = N;
-    if (a_ld % 4) return -3;
-    if (y_ld < N) return -3;
-    if (!b_rb) b_rb = K / 2;
-    if (b_rb < K / 2) return -3;
-    if (b_rb & 15) return -5;
-    if (!sb_rb) sb_rb = K / kGroup;
-    if (sb_rb < K / kGroup) return -3;
-    if (((uintptr_t)a & 3u) || ((uintptr_t)b & 15u)) return -5;
-
-    switch (mt) {
-        case 1:  R3D_INTA8_LAUNCH(1, 4);  break;
-        case 2:  R3D_INTA8_LAUNCH(2, 4);  break;
-        case 4:  R3D_INTA8_LAUNCH(4, 4);  break;
-        case 8:  R3D_INTA8_LAUNCH(8, 4);  break;
-        default: R3D_INTA8_LAUNCH(16, 4); break;
-    }
-    return hipGetLastError() == hipSuccess ? 0 : -4;
-}
-
 extern "C" int r3d_gemm_nt_q_w8a8_m16(long a, long a_scale, long b, long b_scale, long y,
                                       int M, int N, int K, int a_ld, int y_ld, long long b_rb,
                                       long long sb_rb, long stream)
@@ -310,67 +279,10 @@ extern "C" int r3d_gemm_nt_q_w8a8_m16(long a, long a_scale, long b, long b_scale
 
 /* ================================================================== the shims
  *
- * gemm_nt_q's slots: 0 a (I8, step order), 1 a_scale (f32, one per row), 2 b (I4 or I8 codes),
+ * gemm_nt_q's slots: 0 a (I8, step order), 1 a_scale (f32, one per row), 2 b (I8 codes),
  * 3 b_scale (f16, one per (row, 128 of K)), 4 y (bf16), 5 a_sum (absent: symmetric),
  * 6 b_ref (absent).
  */
-
-extern "C" int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s)
-{
-    if (!a) return R3D_NO(RAD_E_INVAL);
-    const char* dt = r3d_gets(a, "dtype");
-    if (dt && std::strcmp(dt, "w4a8") != 0) return R3D_NO(RAD_E_DTYPE);
-
-    const RadTensor* A = r3d_opt(a, 0);
-    const RadTensor* AS = r3d_opt(a, 1);
-    const RadTensor* B = r3d_opt(a, 2);
-    const RadTensor* BS = r3d_opt(a, 3);
-    const RadTensor* Y = r3d_opt(a, 4);
-    const RadTensor* ASUM = r3d_opt(a, 5);
-    const RadTensor* BREF = r3d_opt(a, 6);
-    if (!r3d_p(A) || !r3d_p(AS) || !r3d_p(B) || !r3d_p(BS) || !r3d_p(Y))
-        return R3D_NO(RAD_E_INVAL);
-    if (r3d_has(ASUM) || r3d_has(BREF)) return R3D_NO(RAD_E_DTYPE);   /* symmetric: nothing to remove */
-
-    if (!r3d_is_i8(A)) return R3D_NO(RAD_E_DTYPE);
-    if (!r3d_is_f32(AS)) return R3D_NO(RAD_E_DTYPE);
-    if (B->dtype != RAD_I4) return R3D_NO(RAD_E_DTYPE);
-    if (BS->dtype != RAD_F16) return R3D_NO(RAD_E_DTYPE);
-    if (!r3d_is_bf16(Y)) return R3D_NO(RAD_E_DTYPE);
-
-    const long long N = r3d_geti_or(a, "N", 0), K = r3d_geti_or(a, "K", 0);
-    if (N < 1 || K < 1) return R3D_NO(RAD_E_SHAPE);
-    if (K % kGroup) return R3D_NO(RAD_E_SHAPE);
-
-    const long long ynel = r3d_numel(Y);
-    if (ynel % N) return R3D_NO(RAD_E_SHAPE);
-    const long long M = ynel / N;
-    if (M < 1 || M > kMTMax) return R3D_NO(RAD_E_SHAPE);
-
-    if (r3d_numel(A) < M * K) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(AS) < M) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(B) < N * K) return R3D_NO(RAD_E_SHAPE);
-    if (r3d_numel(BS) < N * (K / kGroup)) return R3D_NO(RAD_E_SHAPE);
-
-    const long long ap = r3d_row_pitch(A);
-    if (ap < K || ap % 4) return R3D_NO(RAD_E_STRIDE);
-    if (!r3d_contig(B)) return R3D_NO(RAD_E_STRIDE);
-    long long yrows = 0;
-    const long long yp = r3d_rows_pitch(Y, N, &yrows);
-    if (yp < N) return R3D_NO(RAD_E_STRIDE);
-    if (!r3d_aligned(r3d_p(A), 4) || !r3d_aligned(r3d_p(B), 16)) return R3D_NO(RAD_E_ALIGN);
-
-    const long long bbr = r3d_row_pitch(B) / 2;   /* I4 pitch is in elements, two per byte */
-    const int rc = r3d_gemm_nt_q_w4a8_m16(r3d_addr(A), r3d_addr(AS), r3d_addr(B), r3d_addr(BS),
-                                          r3d_addr(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp,
-                                          bbr, (long long)r3d_row_pitch(BS), (long)s);
-    if (rc == -1) return R3D_NO(RAD_E_INVAL);
-    if (rc == -2) return R3D_NO(RAD_E_SHAPE);
-    if (rc == -3) return R3D_NO(RAD_E_STRIDE);
-    if (rc == -5) return R3D_NO(RAD_E_ALIGN);
-    if (rc == -4) return R3D_NO(RAD_E_DEVICE);
-    return RAD_OK;
-}
 
 extern "C" int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s)
 {

@@ -165,7 +165,8 @@ static void check_table() {
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w2a8_tiled")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")
                          || 0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64");
-        if (!std::strcmp(k->name, "gemm_nt_q_iqr") || is_expert_iqr_row(k->name)) {
+        const bool packed_w4 = !std::strcmp(k->name, "gemm_w4a8_nt_m64");
+        if (!std::strcmp(k->name, "gemm_nt_q_iqr") || is_expert_iqr_row(k->name) || packed_w4) {
             if (!k->layout || !k->relayout || !k->unrelayout || !k->opd_shape)
                 fail("row '%s' lacks a packed weight or operand description hook", k->name);
         } else if ((k->layout && !joined) || (k->layout && !k->relayout) || (k->relayout && !joined)
@@ -2538,6 +2539,10 @@ static int run_row(int i) {
     }
     if (!std::strcmp(k->name, "gemm_nt_q_iqr")) {
         skip("canonical operands require trellis relayout; covered by r3d_iqr_device_test_card");
+        return 0;
+    }
+    if (!std::strcmp(k->name, "gemm_w4a8_nt_m64")) {
+        skip("the weight is read in its fragment-order layout; rad-kbench lays it out and checks it");
         return 0;
     }
     const int hand = k->opd_shape ? 0

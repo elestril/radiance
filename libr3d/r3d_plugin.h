@@ -399,10 +399,10 @@ int r3d_rad_gemm_nt_q_mxfp4a8_tiled(const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_mxfp4a8_m16_alu  (const RadArgs* a, RadStream s);
 int r3d_rad_gemm_nt_q_mxfp4a8_tiled_alu(const RadArgs* a, RadStream s);
 
-/* --- r3d_gemm_inta8.hip: the symmetric int4 and int8 weight grids at decode heights. The weight
- * is signed codes (I4 two per byte, or I8) with a plain f16 scale per (row, 128 of K). No zero
- * point and no a_sum, so both planes are read in place and the rows have no layout hook. */
-int r3d_rad_gemm_nt_q_w4a8_m16(const RadArgs* a, RadStream s);
+/* --- r3d_gemm_inta8.hip: the symmetric int8 weight grid at decode heights. The weight is signed
+ * I8 codes with a plain f16 scale per (row, 128 of K). No zero point and no a_sum, so both planes
+ * are read in place and the row has no layout hook. r3d_shape_gemm_nt_q_w4a8 describes the
+ * symmetric int4 grid for gemm_w4a8_nt_m64 (r3dh_gemm_w4a8_nt_m64.hip). */
 int r3d_rad_gemm_nt_q_w8a8_m16(const RadArgs* a, RadStream s);
 int r3d_shape_gemm_nt_q_w4a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);
 int r3d_shape_gemm_nt_q_w8a8(const RadParam* p, int n_p, int operand, RadOpdDesc* out);

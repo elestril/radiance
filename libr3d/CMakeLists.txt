@@ -189,6 +189,8 @@ set(R3D_UNITS
   "r3dh_router_gemm_scatter|"
   # Gemma 4's sandwich-norm joins: one launch for each post-norm / add / pre-norm chain.
   "r3dh_norm_join_bf16|"
+  # The dense w4a8 GEMM (Gemma 4 31B's trunk) and its weight layout (r3dh_w4_layout.cpp).
+  "r3dh_gemm_w4a8_nt_m64|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )
@@ -214,8 +216,10 @@ endforeach()
 
 # The host sources are declaration only: the row table and the operand descriptions. They are pure
 # host C++ that includes neither r3d.h nor hip_runtime.h, so the tables compile and can be inspected
-# without ROCm. On gfx1100 the dense and routed IQR rows add their reversible host weight layouts.
-set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp)
+# without ROCm. r3dh_w4_layout.cpp is the dense w4a8 GEMM's host weight layout (its layout,
+# relayout and unrelayout hooks). On gfx1100 the dense and routed IQR rows add their reversible
+# host weight layouts.
+set(R3D_DECLARATION r3d_rows.cpp r3d_shapes.cpp r3dh_w4_layout.cpp)
 if(R3D_GPU_TARGETS STREQUAL "gfx1100")
   list(APPEND R3D_SRC ${CMAKE_CURRENT_SOURCE_DIR}/r3d_gemm_iqr.hip)
   list(APPEND R3D_SRC "${CMAKE_CURRENT_SOURCE_DIR}/r3dh_moe_iqr.hip")

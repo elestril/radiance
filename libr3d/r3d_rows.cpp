@@ -1641,11 +1641,8 @@ static const RadConstraint cGemmQMxfp4a8Tiled[] = { C_IN("dtype", "mxfp4a8"),
                                                     C_GE("M", 17),
                                                     C_DIV("K", 128) };
 
-/* The symmetric int4 / int8 weight grids at decode heights: the block is the weight's scale group
+/* The symmetric int8 weight grid at decode heights: the block is the weight's scale group
  * (128) and the band is M <= 16. No row serves the 8-bit grid at prefill heights. */
-static const RadConstraint cGemmQW4A8M16[]  = { C_IN("dtype", "w4a8"),
-                                                C_GE("M", 1), C_LE("M", 16),
-                                                C_DIV("K", 128), C_GE("N", 1) };
 static const RadConstraint cGemmQW8A8M16[]  = { C_IN("dtype", "w8a8"),
                                                 C_GE("M", 1), C_LE("M", 16),
                                                 C_DIV("K", 128), C_GE("N", 1) };
@@ -1789,6 +1786,13 @@ extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s
 extern "C" int r3dh_rad_attn_window_h512_gqa16_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_ahead_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_layout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
+                                  const RadTensor*, int, RadLayout*);
+extern "C" int r3dh_rad_relayout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
+                                    const RadTensor*, int, void*, int64_t);
+extern "C" int r3dh_rad_unrelayout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
+                                      const void*, int64_t, const RadTensor*, int);
 extern "C" int r3dh_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, int, void**);
 extern "C" void r3dh_rad_router_gemm_topk_scatter_fini(void* inst);
 extern "C" int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs* a);
@@ -1830,6 +1834,12 @@ static const RadConstraint cRouterGemmTopkScatter[] = { C_GE("M", 1), C_LE("M", 
                                                         C_GE("n_expert", 1), C_LE("n_expert", 512),
                                                         C_GE("top_k", 1), C_LE("top_k", 16),
                                                         C_IN("dtype", "bf16") };
+/* libhalo's skinny w4a8 GEMM at the symmetric grid, at every M its launcher takes (8192): above
+ * 64 rows each 64-row block re-reads the weight. libhalo's tiled prefill form (gemm_w4a8_tiled)
+ * disagreed with libref on gfx1100 (rel_l2 ~1 on every case) and is not carried. */
+static const RadConstraint cGemmW4A8M64[] = { C_IN("dtype", "w4a8"), C_GE("M", 1), C_LE("M", 8192),
+                                              C_DIV("K", 128), C_DIV("N", 16),
+                                              C_EQ("group", R3D_FP8_BLOCK) };
 /* The open-ended window (attn_paged_ahead): non-causal, a window of at least one. */
 static const RadConstraint cWinAheadH256G2Bf16[] = { C_EQ("head_dim", 256), C_EQ("gqa", 2),
                                                      C_EQ("block_size", 16), C_EQ("causal", 0),
@@ -2926,18 +2936,10 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_gemm_nt_q_mxfp4a8_m16,
   nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_mxfp4a8 },
 
-{ "gemm_nt_q_w4a8_m16", "gemm_nt_q", "gemm",
-  "the symmetric 4-bit weight grid at decode: signed int4 codes against int8 activations, the "
-  "group's integer sub-sum scaled once by the activation's row scale and the weight's group scale",
-  "M <= 16, K a multiple of 128; one wave a weight row, 64 codes a lane from two 16-byte loads, "
-  "the pair fold at the group boundary, the group terms scaled in the epilogue",
-  "I8 a in the step order with an f32 scale per row, I4 codes b (two a byte) with an f16 scale "
-  "per (row, 128 of K), bf16 y, fp32 accumulation; the sub-sums are exact integers under 2^24, "
-  "and the store is the only narrowing; no zero point, so no a_sum",
-  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
-  ROW(cGemmQW4A8M16), NOTUNE,
-  nullptr, nullptr, r3d_rad_gemm_nt_q_w4a8_m16,
-  nullptr, nullptr, nullptr, r3d_shape_gemm_nt_q_w4a8 },
+/* gemm_nt_q at w4a8: libhalo's skinny GEMM (r3dh_gemm_w4a8_nt_m64.hip), which reads
+ * the weight in its fragment-order layout (r3dh_w4_layout.cpp). The canonical-order m16 row that
+ * served M <= 16 here is gone: one weight is stored once, so the dtype's rows share one layout,
+ * and the rows past 16 need the fragment order. */
 
 { "gemm_nt_q_w8a8_m16", "gemm_nt_q", "gemm",
   "the symmetric 8-bit weight grid at decode: signed int8 codes against int8 activations, the "
@@ -3601,6 +3603,18 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cBf16Row), NOTUNE,
   nullptr, nullptr, r3dh_rad_gelu_mul, nullptr, nullptr, nullptr, r3d_shape_silu_mul },
+{ "gemm_w4a8_nt_m64", "gemm_nt_q", "gemm",
+  "skinny GEMM with a 4-bit weight and an 8-bit activation, 16x16x16 int8 WMMA, split-K reduced "
+  "in LDS",
+  "M <= 8192 (a 64-row block each, re-reading the weight above 64); N a multiple of 16; K "
+  "divisible by SK*128; weight pre-permuted into fragment order "
+  "(r4d.w4.frag.g128); activation byte-shuffled inside each k step (quant_act_i8's order)",
+  "int8 A with an f32 per-row scale, signed 4-bit W with an f16 scale per 128 K, bf16 C, int32 "
+  "accumulate per group",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
+  ROW(cGemmW4A8M64), NOTUNE,
+  nullptr, nullptr, r3dh_rad_gemm_w4a8_m64, nullptr, r3dh_rad_layout_w4, r3dh_rad_relayout_w4,
+  r3d_shape_gemm_nt_q_w4a8, r3dh_rad_unrelayout_w4 },
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
   "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",

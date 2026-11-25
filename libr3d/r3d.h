@@ -248,15 +248,12 @@ int r3d_gemm_nt_q_mxfp4a8_tiled(long a, long a_scale, long b_codes, long b_scale
 
 /* ================================================================== r3d_gemm_inta8.hip
  *
- * The quantised GEMM at dtype=w4a8 and w8a8: symmetric int4 and int8 weight grids at decode
- * heights. `b` is the signed codes (I4 two per byte, or I8), [N, K]; `b_scale` the f16 scale, one
- * per (row, 128 of K), [N, K/128]; `a` int8 in step order with `a_scale` f32 per row; `y` bf16.
- * b_rb and sb_rb are the row strides (bytes / elements), 0 meaning dense. No zero point: the
- * dequant is code times scale. M <= 16 only; prefill heights are served by the tiled rows, and the
+ * The quantised GEMM at dtype=w8a8: the symmetric int8 weight grid at decode heights. `b` is the
+ * signed I8 codes, [N, K]; `b_scale` the f16 scale, one per (row, 128 of K), [N, K/128]; `a` int8
+ * in step order with `a_scale` f32 per row; `y` bf16. b_rb and sb_rb are the row strides (bytes /
+ * elements), 0 meaning dense. No zero point: the dequant is code times scale. M <= 16 only; the
  * 8-bit grid at prefill heights is declared outside this unit.
  */
-int r3d_gemm_nt_q_w4a8_m16(long a, long a_scale, long b, long b_scale, long y, int M, int N,
-                           int K, int a_ld, int y_ld, long long b_rb, long long sb_rb, long stream);
 int r3d_gemm_nt_q_w8a8_m16(long a, long a_scale, long b, long b_scale, long y, int M, int N,
                            int K, int a_ld, int y_ld, long long b_rb, long long sb_rb, long stream);
 
