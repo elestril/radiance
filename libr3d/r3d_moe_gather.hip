@@ -129,6 +129,11 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
      * table covers only the tokens present, so it may be shorter than M * top_k (the kernel
      * zeroes the padding rows). It may never be longer. */
     if (T > (uint64_t)M * top_k) return R3D_NO(RAD_E_SHAPE);
+    /* The launch covers y's rows, not the band's capacity: a decode step issues one row against a
+     * band whose M is the step's ceiling, and a block a padding row only zeroes it. Rows of y past
+     * its view are not y's. */
+    const long long y_rows = y->rank >= 1 ? y->shape[0] : M;
+    const long long Mg = y_rows < M ? y_rows : M;
 
     // The optional shared arm (operands 3 and 4, present together).
     const RadTensor* sh = r3d_opt(a, 3), *sg = r3d_opt(a, 4);
@@ -145,7 +150,7 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
     }
 
     const bool f32w = (ew->dtype == RAD_F32);
-    dim3 grid((unsigned)M, (unsigned)((n + kGatherThr - 1) / kGatherThr)), blk(kGatherThr);
+    dim3 grid((unsigned)Mg, (unsigned)((n + kGatherThr - 1) / kGatherThr)), blk(kGatherThr);
     if (f32w)
         R3D_KLAUNCH(gather_kernel<Gk::f32_sorted>, grid, blk, (hipStream_t)s,
                     (const uint16_t*)r3d_p(ye), r3d_p(ew), (const int32_t*)r3d_p(sorted),
