@@ -3334,7 +3334,15 @@ static void check_conv_numerics() {
  * (rope_ladder_case): an f32 mirror of libref's rotation at the three ladders. `head` is the
  * proportional ladder: pair i is (i, i + head_dim/2), the exponent's divisor is head_dim, and the
  * pairs from rotary_dim/2 on do not turn. Q and K heads rotate; the V head must come back byte
- * for byte. */
+ * for byte.
+ *
+ * Static YaRN (abi/rad_yarn.h) at two geometries: the one Gemma 4's full layers state, the whole
+ * head named and the pairs past a quarter of it divided by 1e30 (a step between pair 7.5 and 8);
+ * and a ramp with a magnitude, which blends the ladder pair by pair and scales cos and sin. The
+ * mirror writes rad_yarn.h's blend out. Under the ramp every pair turns and every value is
+ * rounded: the mirror rounded to bf16 is itself 2.05e-3 from the unrounded one on this data, so
+ * that case's tolerance is 3e-3, where a wrong blend or a missing magnitude is an error of
+ * tenths. */
 static void check_rope_numerics() {
     std::printf("== rope, by value\n");
 #ifndef RAD_HAVE_HIP
@@ -3345,16 +3353,30 @@ static void check_rope_numerics() {
     if (!fn) { fail("r3d_rad_rope is missing"); return; }
     int ndev = 0;
     if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
-    const long long M = 5, hd = 64, rot = 32, n_head = 2, nkv = 1, n_rope = n_head + nkv;
+    const long long M = 5, hd = 64, n_head = 2, nkv = 1, n_rope = n_head + nkv;
     const long long row = (n_head + 2 * nkv) * hd;
     const float theta = 10000.0f;
     const std::vector<int32_t> pos = { 0, 1, 7, 128, 4096 };
-    for (const char* lad : { (const char*)nullptr, "rotary", "head" }) {
+    struct RopeCase { const char* lad; long long rot; float factor, low, high, magnitude;
+                      double tol; };
+    const RopeCase cases[] = { { nullptr, 32, 0.0f, 0.0f, 0.0f, 1.0f, 2e-3 },
+                               { "rotary", 32, 0.0f, 0.0f, 0.0f, 1.0f, 2e-3 },
+                               { "head", 32, 0.0f, 0.0f, 0.0f, 1.0f, 2e-3 },
+                               { nullptr, 64, 1e30f, 7.5f, 8.0f, 1.0f, 2e-3 },
+                               { nullptr, 64, 4.0f, 4.0f, 12.0f, 1.25f, 3e-3 } };
+    for (const RopeCase& geo : cases) {
+        const char* lad = geo.lad;
+        const long long rot = geo.rot;
         const bool head = lad && !std::strcmp(lad, "head");
         const long long den = head ? hd : rot, off = head ? hd / 2 : rot / 2;
-        char what[96];
-        std::snprintf(what, sizeof(what), "rope neox, head_dim 64, rotary_dim 32, ladder %s",
-                      lad ? lad : "absent");
+        char what[128];
+        if (geo.factor != 0.0f)
+            std::snprintf(what, sizeof(what), "rope neox, head_dim 64, rotary_dim %lld, yarn "
+                          "factor %g over pairs %g..%g, magnitude %g", rot, (double)geo.factor,
+                          (double)geo.low, (double)geo.high, (double)geo.magnitude);
+        else
+            std::snprintf(what, sizeof(what), "rope neox, head_dim 64, rotary_dim 32, ladder %s",
+                          lad ? lad : "absent");
         std::vector<uint16_t> x((size_t)(M * row));
         for (long long i = 0; i < M * row; ++i) {
             float v = (float)(((i * 5) % 17) - 8) / 9.0f;
@@ -3370,6 +3392,13 @@ static void check_rope_numerics() {
                                     RadParam{ "scale", RAD_P_F64, 0, 0, nullptr, 1.0 },
                                     ps("mode", "neox"), pi("rotary_dim", rot) };
         if (lad) p.push_back(ps("ladder", lad));
+        if (geo.factor != 0.0f) {
+            const struct { const char* key; float v; } yarn[] = {
+                { "yarn_factor", geo.factor }, { "yarn_low", geo.low }, { "yarn_high", geo.high },
+                { "yarn_magnitude", geo.magnitude } };
+            for (const auto& y_ : yarn)
+                p.push_back(RadParam{ y_.key, RAD_P_F64, 0, 0, nullptr, (double)y_.v });
+        }
         RadArgs a{ t, 2, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
         const int rc = fn(&a, nullptr);
         hipDeviceSynchronize();
@@ -3387,9 +3416,14 @@ static void check_rope_numerics() {
                 for (long long i = 0; i < rot / 2; ++i) {
                     const float x0 = bf16_to_f32(x[base + h * hd + i]);
                     const float x1 = bf16_to_f32(x[base + h * hd + i + off]);
-                    const float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
-                    const float sn = sinf((float)pos[(size_t)m] * inv);
-                    const float cs = cosf((float)pos[(size_t)m] * inv);
+                    float inv = 1.0f / powf(theta, (float)(2 * i) / (float)den);
+                    if (geo.factor != 0.0f) {
+                        const float ramp = fminf(1.0f, fmaxf(0.0f, ((float)i - geo.low) /
+                                                                   (geo.high - geo.low)));
+                        inv = (inv / geo.factor) * ramp + inv * (1.0f - ramp);
+                    }
+                    const float sn = sinf((float)pos[(size_t)m] * inv) * geo.magnitude;
+                    const float cs = cosf((float)pos[(size_t)m] * inv) * geo.magnitude;
                     w[(size_t)i] = x0 * cs - x1 * sn;
                     w[(size_t)(i + off)] = x0 * sn + x1 * cs;
                 }
@@ -3400,7 +3434,7 @@ static void check_rope_numerics() {
             for (long long e = 0; e < hd; ++e)
                 v_moved += got[base + n_rope * hd + e] != x[base + n_rope * hd + e];
         }
-        compare(what, ref, y, 2e-3);
+        compare(what, ref, y, geo.tol);
         if (v_moved) fail("%s: %lld values of the V head moved", what, v_moved);
         else ok("%s: the V head byte for byte", what);
     }

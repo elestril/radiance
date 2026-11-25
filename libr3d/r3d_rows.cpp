@@ -1302,8 +1302,10 @@ static const RadConstraint cMoeGemmQMod4[] = { C_GE("n_expert", 4) };
 static const RadConstraint cFillI32[]  = { C_IN("dtype", "i32") };
 static const RadConstraint cFillI64[]  = { C_IN("dtype", "i64") };
 
-/* rope: the two modes this kernel implements and an even head_dim. The yarn, llama3 and ladder
- * parameters are absent from these rows' bands, so a geometry carrying them is not routed here.
+/* rope: the two modes this kernel implements and an even head_dim. The rows state no constraint on
+ * the yarn, llama3 and ladder parameters, so a geometry carrying them resolves here: the shim serves
+ * static YaRN at a position scale of 1 and the `rotary` and `head` ladders, and refuses llama3,
+ * YaRN at another scale and any other ladder (RAD_E_UNSUPPORTED).
  * `rotary_dim` cannot be constrained: it is optional, a constraint on a key the band does not carry
  * does not hold (see r3d_selftest.cpp's band-reachability phase), and llama-family graphs, which
  * rotate the whole head, omit it. The shim refuses an odd rotary_dim (RAD_E_SHAPE); absent, it is
