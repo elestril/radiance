@@ -7075,7 +7075,7 @@ TEST(gemma4_moe_declares_and_runs_the_26b_vision_tower_only_when_enabled) {
     CHECK_OK(gemma4::probe(&meta, &p));
     CHECK_EQ(p.enc_merge, 9);
     CHECK_EQ(p.draft_depth, 15);
-    CHECK_EQ(p.chain_pays, RAD_CHAIN_SPEC); // retain current upstream policy pending device evidence
+    CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);   /* plain decode chained (gemma4.cpp, probe) */
 
     std::vector<std::string> text_ops;
     for (int patches : { 0, 18 }) {
@@ -7339,7 +7339,7 @@ TEST(gemma4_probe_names_the_dflash_blocks_depth) {
     CHECK_OK(gemma4::probe(&meta, &p));
     CHECK_EQ(p.draft_depth, 15);
     CHECK_EQ(p.draft_depth_fixed, 1);
-    CHECK_EQ(p.chain_pays, 1);   /* chained launches measured a gain with DFlash */
+    CHECK_EQ(p.chain_pays, (int)RAD_CHAIN_ALWAYS);   /* with DFlash and without a drafter */
 
     for (size_t i = 0; i < keys.size(); ++i)
         if (!std::strcmp(keys[i], "draft.architectures")) vals[i] = "[\"DFlash2DraftModel\"]";
@@ -7352,6 +7352,7 @@ TEST(gemma4_probe_names_the_dflash_blocks_depth) {
     RadArchProbe r{};
     CHECK_OK(gemma4::probe(&plain, &r));
     CHECK_EQ(r.draft_depth, 0);
+    CHECK_EQ(r.chain_pays, (int)RAD_CHAIN_ALWAYS);
 }
 
 /* Each tap is declared where it is issued. The buffer planner takes liveness from declaration

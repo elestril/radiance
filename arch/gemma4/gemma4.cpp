@@ -1961,6 +1961,10 @@ static int probe(const RadModelMeta* meta, RadArchProbe* out) {
     if (!meta || !out) return RAD_E_INVAL;
     out->draft_depth = 0;
     (void)dflash_probe(meta, out);
+    /* Chained launches with or without a drafter: the 26B-A4B's plain decode on an RX 7900 XT
+     * (libr3d, every launch of its pass chained) went from 84.5 to 87.0 tok/s, the greedy text
+     * the same. Not measured on libr4d's cards, where DFlash's speculative step gained 1%. */
+    out->chain_pays = RAD_CHAIN_ALWAYS;
     if (Gemma4Vision::present(meta)) {
         const int64_t k = rad_meta_geti(meta, "vision_config.pooling_kernel_size", 0);
         if (k > 0) out->enc_merge = k * k;
