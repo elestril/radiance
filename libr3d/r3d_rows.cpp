@@ -1016,6 +1016,11 @@ static const RadOpSchema kSchemas[] = {
            "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once."),
     SCHEMA("logit_softcap", pMnCap, oUnary,
            "y = cap * tanh(x / cap); the final-logit softcap. `cap` is required and > 0."),
+    SCHEMA("rmsnorm_p", pLayernorm, oUnary,
+           "y = x * rsqrt(mean(x^2) + eps); an rmsnorm with NO gain tensor at all."),
+    SCHEMA("gelu_mul", pMnDtype, oGateUp,
+           "y[i] = gelu_tanh(gate_up[i]) * gate_up[n + i], the tanh approximation, the gate the "
+           "first half as in silu_mul."),
     SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
            "attn_paged, parameter for parameter and value for value, with q read at its own row "
            "pitch: a column slice of a wider row (the q part of a fused [q|k|v] projection)."),
@@ -1707,6 +1712,8 @@ extern "C" int r3dh_rad_seg_mean(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_act_mul(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_mul_weight(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_logit_softcap(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_rmsnorm_p(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_gelu_mul(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s);
 extern "C" int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs* a);
@@ -3447,6 +3454,20 @@ static const RadKernelInfo kKernels[] = {
   ROW(cWinH512G8Bf16), NOTUNE,
   nullptr, nullptr, r3dh_rad_attn_window_h512_gqa8_bf16, r3dh_rad_attn_window_h512_scratch,
   nullptr, nullptr, r3d_shape_attn_paged },
+{ "rmsnorm_p_bf16", "rmsnorm_p", "norm",
+  "weightless RMS norm (no gain), one row a workgroup",
+  "any n; both row pitches read off the operands",
+  "bf16 in and out, f32 sum (a wave butterfly, the partials in wave order), one rounding",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormBf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_rmsnorm_p, nullptr, nullptr, nullptr, r3d_shape_silu },
+{ "gelu_mul_bf16", "gelu_mul", "elem",
+  "gelu_tanh of the first half of a fused [M, 2n] row times the second half",
+  "any n; a row spread over up to 64 blocks",
+  "bf16 in and out, f32 arithmetic, libm tanh, one rounding",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r3dh_rad_gelu_mul, nullptr, nullptr, nullptr, r3d_shape_silu_mul },
 { "attn_qrow_h512_gqa8_bf16kv", "attn_paged_qrow", "attn",
   "paged attention reading q at its own row pitch, any window, causal or not",
   "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen",
