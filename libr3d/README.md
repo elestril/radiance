@@ -382,8 +382,17 @@ decode pass. At group 32 the split form measured rel_l2 1.3e-4 on the gate_up ag
 is the order of summation, one output on the other side of a bf16 rounding boundary (the launch's
 comment has the measurement). The split form is not instantiated or timed at group 32, so
 the QAT container keeps the run-a-block GEMV.
-The remaining weight forms (the nl64/nl32 magnitude-table nibbles), the prefill run map and the
-SK/UW/RS passes are outstanding, per its kernel header.
+Above 32 sorted rows the E4M3 arm is the run-aligned prefill tile (`moe_w4a8_e4m3_pf_kernel`): a
+block is 64 rows of one expert's run by 256 columns, the tile map computed in every wave from the
+offsets (no scratch, no map kernel), both operands decoded to exact f16 into double-buffered LDS a
+32-wide K pass at a time, a wave a 64 x 32 patch, the WMMA issued from inline asm on dword
+fragments (through the f16 builtin, gfx11's real-true16 codegen moves the high half of every
+fragment dword through a 16-bit op of its own). Each element's WMMA chain and fold are the 16-row
+arm's, so the two store the same bytes on every row a run owns. At the 26B-A4B's 2048-token chunk
+(skewed routings, RX 7900 XT) gate_up went from 14.4 to 2.77 ms (51 TF/s) and down from 7.8 to
+1.67 ms; at weight group 32 its every-pass fold spills and gate_up runs 7.9 ms (15.0 before).
+The remaining weight forms (the nl64/nl32 magnitude-table nibbles), the int8 arm's prefill tile and
+the SK/UW/RS passes are outstanding, per its kernel header.
 
 `moe_gemm_w4a4` — the `moe_gemm_q` row at `dtype=w4a4`: int4 activation (packed two per byte),
 packed two's-complement int4 experts. Both operands widen exactly to int8 and run the native i32

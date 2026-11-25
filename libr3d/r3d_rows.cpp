@@ -2733,10 +2733,12 @@ static const RadKernelInfo kKernels[] = {
    "The grouped int4 GEMM over the expert-sorted rows: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, e the "
    "expert of sorted row i; the two's-complement int4 weight (nibbles, -8..7) against an int8 or "
    "E4M3 activation, one scale fold a weight scale group of K (`group`: 128, or 32)",
-   "16 sorted rows per block, eight waves of 16 columns; the block walks its expert runs, the "
-   "padding rows reading the run's first; the decode band (M * top_k <= 16 the tuned point, more "
-   "runs as extra 16-row blocks, prefill falls back to libavx); K % 128, N % 64; the even experts "
-   "are entry e/2 of `w` / `w_scale`, the odd of `w_odd` / `w_odd_scale`; token or sorted a",
+   "E4M3 a: up to 32 sorted rows the decode GEMV (one run a block), above them the run-aligned "
+   "prefill tile (64 rows of one run by 256 columns, both operands decoded to f16 in "
+   "double-buffered LDS, K % 32); int8 a, and an E4M3 a the prefill tile cannot read: 16 sorted rows "
+   "per block, eight waves of 16 columns, the block walking its expert runs, the padding rows "
+   "reading the run's first; K % 128, N % 64; the even experts are entry e/2 of `w` / `w_scale`, "
+   "the odd of `w_odd` / `w_odd_scale`; token or sorted a",
    "I4 (packed, two a byte) weight tables with a bf16 w_scale per (row, `group` of K); int8 a (an "
    "f32 a_scale per (row, 128 of K)) or E4M3 a (an f32 a_scale); bf16 y in sorted order; the int8 "
    "arm is bit-exact against the reference, the E4M3 arm to the f16 store ulp",

@@ -21,9 +21,10 @@
  * reference runs, so the int8 arm agrees bit for bit.
  *
  * A 16-row block walks the expert runs in its rows; where the grid is small (decode) the runs are
- * spread over grid.z, one block a run. STATUS: the w4a8 form is served (both activation arms). Remaining: the codebook NL forms
- * (w4nl64a8h / w4nl32a8h / w5nl64a8h, magnitude-table decode), a prefill path above 16 sorted rows,
- * and the SK/UW/RS tuning.
+ * spread over grid.z, one block a run. An E4M3 activation takes the decode GEMV up to 32 sorted
+ * rows and the run-aligned prefill tile above (both below). STATUS: the w4a8 form is served (both
+ * activation arms). Remaining: the codebook NL forms (w4nl64a8h / w4nl32a8h / w5nl64a8h,
+ * magnitude-table decode), the int8 arm's prefill tile, and the SK/UW/RS tuning.
  */
 #include <hip/hip_runtime.h>
 
@@ -299,6 +300,306 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_e4m3_kernel
             if (rs <= m && m < re && nc < (uint32_t)N) y[(size_t)m * y_ld + nc] = f32_to_bf16(acc[g]);
         }
     }
+}
+
+/* ------------------------------------ E4M3 arm, prefill (run-aligned 64 x 256 tiles, f16 LDS)
+ *
+ * The 16-row block above re-decodes its 128 columns of weight for every 16 rows of a run, nibble
+ * by nibble through f32, and stages each 128-wide K block behind a barrier with nothing in flight:
+ * at a 2048-token chunk of the 26B-A4B (16384 sorted rows) gate_up ran 14.4 ms and down 7.8 ms a
+ * launch (skewed routings, RX 7900 XT), 10 and 9 TF/s of the f16 wave matrix's 103. Here a
+ * block is one 64-row tile of ONE expert's run (libhalo's run-aligned form, kAlignRows) by 256
+ * columns. Each 32-wide K pass is staged into LDS already decoded to exact f16 -- the activation's
+ * E4M3 by bit moves (e4m3x2_f16x2), the weight's nibbles by the 0x6400 magic -- so a staged weight
+ * value serves 64 rows and an activation value 256 columns. The LDS is double-buffered: pass p
+ * multiplies one buffer while pass p + 1 is decoded into the other and pass p + 3's raw bytes are
+ * loaded, one LDS-only barrier a pass. A wave owns a 64 x 32 patch (4 x 2 wave-matrix tiles), six
+ * fragment reads for eight WMMAs: the fragment reads, not the WMMAs, were the 64 x 128 tile's limit
+ * (2 x 2 patches, 3.3 ms). Tiles of a short run skip their empty 16-row tiles.
+ *
+ * The tile map is computed in every wave from the offsets, no LDS, no barrier, no scratch: expert e
+ * owns ceil(rows_e / 64) tiles in expert order and the grid's y axis is an upper bound on their sum
+ * (ceil(T / 64) + n_expert); blocks past it leave. Rows past the live count belong to no run, and
+ * a token-order dropped slot inside one is not stored either: both are left as the caller set them,
+ * as libref leaves them.
+ *
+ * The numbers are the 16-row arm's, element for element: each 128-block's product sum is one
+ * v_wmma_f32_16x16x16_f16 chain of eight 16-K steps in ascending k from zero (carried over the four
+ * passes of the block), on the same exact f16 operands, then folded as
+ * acc += blk * a_scale[src][b] * w_scale[e][n][group] in ascending block order (at weight group 32,
+ * four folds a block, as there). So the two arms store the same bytes (checked at 2048 tokens, both
+ * orders, both groups). Measured at a 2048-token chunk, skewed routings: gate_up 2.77 ms (51 TF/s),
+ * down 1.67 ms; at group 32 the fold every pass spills 79 registers and gate_up runs 7.9 ms (the
+ * 16-row arm 15.0). */
+constexpr int kPfM = 64;                // rows a tile: one run's, or part of one
+constexpr int kPfN = 256;               // columns a tile: eight waves of 32
+constexpr int kPfK = 32;                // K a staged pass: a quarter of a scale block
+constexpr int kPfP = kPfK + 8;          // f16 a staged row: 80 bytes, 16-byte aligned, banks spread
+constexpr int kPfMaxE = 256;            // experts the in-wave tile map covers (8 a lane)
+
+__device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t v);   // below, with the decode GEMV
+
+/* This block's (expert, first row, end row), or false when blockIdx.y is past the last tile. */
+__device__ __forceinline__ bool moe_pf_tile(const int32_t* __restrict__ off, int n_expert, int T,
+                                            int tile, int lane, int& e, int& r0, int& r1)
+{
+    constexpr int EPL = kPfMaxE / kWave;
+    const int x0 = lane * EPL;
+    int nt[EPL], tot = 0;
+#pragma unroll
+    for (int j = 0; j < EPL; ++j) {
+        const int x = x0 + j;
+        int t = 0;
+        if (x < n_expert) {
+            const int c = off[x + 1] - off[x];
+            t = (c + kPfM - 1) / kPfM;
+        }
+        nt[j] = t;
+        tot += t;
+    }
+    int inc = tot;
+#pragma unroll
+    for (int d = 1; d < kWave; d <<= 1) {
+        const int v = __shfl_up(inc, d);
+        if (lane >= d) inc += v;
+    }
+    if (tile >= __shfl(inc, kWave - 1)) return false;
+    const int owner = __ffsll((unsigned long long)__ballot(tile < inc)) - 1;
+    int ee = 0, rr = 0;
+    {
+        int q = tile - (inc - tot);
+#pragma unroll
+        for (int j = 0; j < EPL; ++j) {
+            if (q >= 0 && q < nt[j]) { ee = x0 + j; rr = q; }
+            q -= nt[j];
+        }
+    }
+    e = __shfl(ee, owner);
+    rr = __shfl(rr, owner);
+    const int o1 = off[e + 1] < T ? off[e + 1] : T;
+    r0 = off[e] + rr * kPfM;
+    r1 = r0 + kPfM < o1 ? r0 + kPfM : o1;
+    return r0 < r1;
+}
+
+/* A barrier that orders LDS only (libhalo's lds_barrier): __syncthreads() is a workgroup fence over
+ * every address space, so it would wait for the next pass's global loads in flight. */
+__device__ __forceinline__ void moe_pf_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+/* A wave-matrix fragment from LDS: 16 f16 at one row, read as two 16-byte words and reinterpreted.
+ * Read as a v16half the compiler moves every half through a 16-bit register op (two VALU a dword
+ * the wave matrix waits behind). */
+typedef unsigned int moe_u32x8 __attribute__((ext_vector_type(8)));
+typedef moe_u32x8 moe_v16hf;
+__device__ __forceinline__ moe_v16hf moe_pf_frag(const uint16_t* p)
+{
+    const r3d_u32x4 lo = *(const r3d_u32x4*)p, hi = *(const r3d_u32x4*)(p + 8);
+    return moe_u32x8{ lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w };
+}
+/* v_wmma_f32_16x16x16_f16 on two fragments held as dwords. Through the builtin the fragments are
+ * f16 vectors, and gfx11's real-true16 codegen then moves the high half of every fragment dword
+ * through a 16-bit op of its own (128 v_mov_b16 a pass, the wave matrix waiting behind them). The
+ * A and B operands here are LDS loads, never an earlier WMMA's result, so the WMMA-reads-WMMA
+ * hazard the compiler would pad does not arise. */
+__device__ __forceinline__ v8float moe_pf_wmma(const moe_u32x8& a, const moe_u32x8& b, v8float c)
+{
+    asm("v_wmma_f32_16x16x16_f16 %0, %1, %2, %0" : "+v"(c) : "v"(a), "v"(b));
+    return c;
+}
+
+template <int WG>
+__global__ __launch_bounds__(kThreads) void moe_w4a8_e4m3_pf_kernel(
+    const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
+    int n_expert, int top_k, int a_sorted)
+{
+    __shared__ __align__(16) uint16_t s_a[2][kPfM * kPfP];
+    __shared__ __align__(16) uint16_t s_b[2][kPfN * kPfP];
+    __shared__ int32_t s_tok[kPfM];
+    __shared__ float s_sa[2][kPfM];              // a block's a-scales, by block parity
+
+    const int tid = (int)threadIdx.x, lane = tid & (kWave - 1);
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int wn = wave;                         // the wave's 64 x 32 patch: every row, cols wn*32
+
+    int e, r0, r1;
+    if (!moe_pf_tile(off, n_expert, T, (int)blockIdx.y, lane, e, r0, r1)) return;
+    const int n0 = (int)blockIdx.x * kPfN;
+
+    // The source row of each of the tile's rows; -1 a token-order dropped slot, which the
+    // reference leaves as the caller set it (read as row 0, never stored). Rows past the run read
+    // its first.
+    if (tid < kPfM) {
+        const int i = r0 + tid < r1 ? r0 + tid : r0;
+        s_tok[tid] = a_sorted ? i : (sorted[i] < 0 ? -1 : sorted[i] / top_k);
+    }
+
+    const int cls = e & 1, e2 = e >> 1;
+    const uint8_t* wbase = r3d_tab_at(tw.w[cls], e2);
+    const int w_rb = tw.w[cls].ld / 2;           // bytes a weight row
+    const uint16_t* wsb = (const uint16_t*)r3d_tab_at(tw.s[cls], e2);
+    const int ws_ld = tw.s[cls].ld;
+
+    // Staging, one piece a thread a pass: the activation as 64 rows x 4 eight-byte pieces (eight
+    // E4M3 codes), the weight as 256 columns x 16 bytes (32 nibbles).
+    const int arow = tid >> 2, aseg = (tid & 3) * 8;
+    const int bcol = tid, bseg = 0;
+    const int bn = n0 + bcol < N ? n0 + bcol : N - 1;
+    const uint8_t* bsrc = wbase + (size_t)bn * w_rb + bseg;
+    moe_pf_barrier();                             // s_tok
+    const uint8_t* asrc = a + (size_t)(s_tok[arow] < 0 ? 0 : s_tok[arow]) * a_ld + aseg;
+    const int sa_row = tid < kPfM ? (s_tok[tid] < 0 ? 0 : s_tok[tid]) : 0;
+
+    // The wave's columns (for the weight scales), and the 16-row tiles the run reaches.
+    const int nmt = (r1 - r0 + 15) / 16;
+    int ncol[2];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int n = n0 + wn * 32 + j * 16 + (lane & 15);
+        ncol[j] = n < N ? n : N - 1;
+    }
+
+    const int np = K / kPfK;                      // passes; a multiple of four (K % 128)
+    uint2 ra[2];                                  // a pass's raw bytes, by pass parity
+    r3d_u32x4 rb[2];
+    float sa_n = 0.f;                             // the a-scale of the next block's first pass
+    float sw[2][2];                               // a pass's weight scales, by pass parity
+    auto issue = [&](int q, uint2& xa, r3d_u32x4& xb) {
+        xa = *(const uint2*)(asrc + q * kPfK);
+        xb = *(const r3d_u32x4*)(bsrc + q * (kPfK / 2));
+        if ((q % (kGroup / kPfK)) == 0 && tid < kPfM)
+            sa_n = a_scale[(size_t)sa_row * as_ld + q / (kGroup / kPfK)];
+    };
+    // Decode pass q's raw bytes into buffer `buf`, with its a-scales (a block's first pass) and
+    // its weight scales (the pass a fold closes).
+    auto stage = [&](int q, int buf, const uint2& xa, const r3d_u32x4& xb, float (&swq)[2]) {
+        {
+            // E4M3 -> f16: bytes b0..b3 of a dword to the f16 pairs (b0, b1), (b2, b3).
+            const uint32_t in[2] = { xa.x, xa.y };
+            uint32_t h[4];
+#pragma unroll
+            for (int t = 0; t < 2; ++t) {
+                h[2 * t]     = e4m3x2_f16x2(__builtin_amdgcn_perm(0u, in[t], 0x010c000cu));
+                h[2 * t + 1] = e4m3x2_f16x2(__builtin_amdgcn_perm(0u, in[t], 0x030c020cu));
+            }
+            *(r3d_u32x4*)(s_a[buf] + arow * kPfP + aseg) = r3d_u32x4{ h[0], h[1], h[2], h[3] };
+        }
+        {
+            // int4 -> f16: byte j holds k 2j (low nibble) and 2j+1 (high); (n ^ 8) under the
+            // 0x6400 exponent reads 1024 + (n ^ 8), less 1032 is n, exactly.
+            typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+            const uint32_t in[4] = { xb.x, xb.y, xb.z, xb.w };
+            uint32_t h[16];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const uint32_t x = in[t] ^ 0x88888888u;
+                const uint32_t lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const uint32_t hb = __builtin_amdgcn_perm(hi, lo, 0x0c040c00u + 0x00010001u * k)
+                                      | 0x64006400u;
+                    const h2 hv = __builtin_bit_cast(h2, hb) - h2{ (_Float16)1032.0f, (_Float16)1032.0f };
+                    h[4 * t + k] = __builtin_bit_cast(uint32_t, hv);
+                }
+            }
+            r3d_u32x4* d = (r3d_u32x4*)(s_b[buf] + bcol * kPfP);
+#pragma unroll
+            for (int t = 0; t < 4; ++t) d[t] = r3d_u32x4{ h[4 * t], h[4 * t + 1], h[4 * t + 2], h[4 * t + 3] };
+        }
+        const int b = q / (kGroup / kPfK);
+        if ((q % (kGroup / kPfK)) == 0 && tid < kPfM) s_sa[b & 1][tid] = sa_n;
+        // The weight group a fold at the end of pass q closes: the block's at group 128 (its last
+        // pass), the pass's own at 32.
+        const bool closes = WG == kGroup ? (q % (kGroup / kPfK)) == (kGroup / kPfK) - 1 : true;
+        if (closes) {
+            const int g = WG == kGroup ? b : q;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) swq[j] = bf16_f32(wsb[(size_t)ncol[j] * ws_ld + g]);
+        }
+    };
+
+    v8float acc[4][2], blk[4][2];
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            acc[i][j] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+            blk[i][j] = acc[i][j];
+        }
+
+    // Pass p multiplies buffer p & 1 while pass p + 1 is decoded into the other, and pass p + 3's
+    // bytes are loaded into the registers pass p + 1's just left: one barrier a pass, and the
+    // decode's VALU interleaves with this pass's wave-matrix work.
+    auto step = [&](int p, const int S) {
+        {
+#pragma unroll
+            for (int s = 0; s < kPfK / 16; ++s) {
+                moe_v16hf fb[2];
+#pragma unroll
+                for (int j = 0; j < 2; ++j)
+                    fb[j] = moe_pf_frag(s_b[S] + (wn * 32 + j * 16 + (lane & 15)) * kPfP + s * 16);
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+                    if (i < nmt) {
+                        const moe_v16hf fa = moe_pf_frag(s_a[S] + (i * 16 + (lane & 15)) * kPfP + s * 16);
+#pragma unroll
+                        for (int j = 0; j < 2; ++j) blk[i][j] = moe_pf_wmma(fa, fb[j], blk[i][j]);
+                    }
+            }
+            // A weight group closes: (dot * a_scale[src][b]) * w_scale[e][n][group], libref's order.
+            const bool fold = WG == kGroup ? (p % (kGroup / kPfK)) == (kGroup / kPfK) - 1 : true;
+            if (fold) {
+                const float* sap = s_sa[(p / (kGroup / kPfK)) & 1];
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        const float sa = sap[i * 16 + g * 2 + (lane >> 4)];
+#pragma unroll
+                        for (int j = 0; j < 2; ++j) acc[i][j][g] += blk[i][j][g] * sa * sw[S][j];
+                    }
+#pragma unroll
+                for (int i = 0; i < 4; ++i)
+#pragma unroll
+                    for (int j = 0; j < 2; ++j) blk[i][j] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+            }
+        }
+        if (p + 1 < np) {
+            stage(p + 1, S ^ 1, ra[S ^ 1], rb[S ^ 1], sw[S ^ 1]);
+            if (p + 3 < np) issue(p + 3, ra[S ^ 1], rb[S ^ 1]);
+        }
+        moe_pf_barrier();
+    };
+
+    issue(0, ra[0], rb[0]);
+    issue(1, ra[1], rb[1]);
+    stage(0, 0, ra[0], rb[0], sw[0]);
+    issue(2, ra[0], rb[0]);
+    moe_pf_barrier();
+    for (int p = 0; p < np; p += 2) {
+        step(p, 0);
+        step(p + 1, 1);
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i)
+#pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            const int row = i * 16 + g * 2 + (lane >> 4);
+            const int m = r0 + row;
+            if (m >= r1 || s_tok[row] < 0) continue;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int n = n0 + wn * 32 + j * 16 + (lane & 15);
+                if (n < N) y[(size_t)m * y_ld + n] = f32_to_bf16(acc[i][j][g]);
+            }
+        }
 }
 
 /* --------------------------------------------- E4M3 arm, decode GEMV (fdot2, one run a block)
@@ -698,6 +999,27 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
                           pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,
                           (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar);
         return (int)hipGetLastError();
+    }
+    /* Above the GEMV's 32 rows an E4M3 activation takes the run-aligned prefill tile (faster than
+     * the 16-row arm from 5 tokens up: 142 against 538 us at the 26B-A4B's gate_up), where its
+     * operands are read 8 and 16 bytes at a time. The mrows / wv axes are the 16-row arm's and do
+     * not reach it. */
+    {
+        const bool pf_w = (tw.w[0].ld / 2) % 16 == 0 && (tw.w[1].ld / 2) % 16 == 0 &&
+                          tw.w[0].s0 % 16 == 0 && tw.w[1].s0 % 16 == 0;
+        if (c.a->dtype == RAD_F8E4M3 && c.T > 32 && c.n_expert <= kPfMaxE && c.K % kPfK == 0 &&
+            a_ld % 16 == 0 && r3d_aligned(r3d_p(c.a), 16) && pf_w) {
+            const dim3 pgrid((unsigned)((c.N + kPfN - 1) / kPfN),
+                             (unsigned)((c.T + kPfM - 1) / kPfM + c.n_expert));
+            const uint8_t* pa8 = (const uint8_t*)r3d_p(c.a);
+#define R3D_PF(WGV)                                                                              \
+    R3D_KLAUNCH((moe_w4a8_e4m3_pf_kernel<WGV>), pgrid, dim3(kThreads), (hipStream_t)s, pa8, psa, \
+                ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert,  \
+                (int)c.top_k, c.a_sorted)
+            if (wg == 32) R3D_PF(32); else R3D_PF(128);
+#undef R3D_PF
+            return (int)hipGetLastError();
+        }
     }
     if (grid.x * grid.y < 256u) grid.z = (unsigned)(c.T < mrows ? c.T : mrows);
     if (c.a->dtype == RAD_I8) {
