@@ -489,6 +489,126 @@ __global__ __launch_bounds__(kThreads) void moe_w4a8_e4m3_gemv_kernel(
 
 }  // namespace
 
+namespace {
+/* --------------------------------- E4M3 arm, decode GEMV with K split over the lanes (libr3d)
+ *
+ * A wave takes kLsCols columns of one run's expert, two at a time, and its lanes split K: in each
+ * 256-wide chunk lane l owns k = 256c + 8l .. 8l + 7, one dword of packed weight a column, so a
+ * column's chunk is one coalesced 128-byte read. The run's activation row is decoded once into
+ * registers (NCH chunks x 4 f16 pairs a lane) and its scales a lane's group a chunk, so there is
+ * no LDS and no barrier. A lane's chunk term is (dot8 * a_scale) * w_scale over its eight k, the
+ * terms summed in chunk order and the lanes by the wave butterfly: the reference's order within
+ * eight k, another association across them (the sum's last bits). */
+constexpr int kLsThreads = 128;                 // four waves
+constexpr int kLsCols = 32;                     // columns a wave (8: 89.4, 16: 92.4, 64: 90.5 tok/s; 32: 92.9)
+
+template <int WG, int NCH>
+__global__ __launch_bounds__(kLsThreads) void moe_w4a8_e4m3_gemv_ls_kernel(
+    const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
+    int n_expert, int top_k, int a_sorted, int a_rows)
+{
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+
+    /* the y-th non-empty run, offsets loaded four 32s at once */
+    int e = -1, rs = 0, re = 0;
+    {
+        int base = 0;
+        for (int e0 = 0; e0 < n_expert && e < 0; e0 += 4 * kWave) {
+            int o0[4], o1[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int ee = e0 + u * kWave + (int)lane, ec = ee < n_expert ? ee : n_expert - 1;
+                const int a0 = off[ec], a1 = off[ec + 1];
+                o0[u] = ee < n_expert ? a0 : 0;
+                o1[u] = ee < n_expert ? a1 : 0;
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const uint32_t bal = (uint32_t)__ballot(o1[u] > o0[u]);
+                const int cnt = __popc(bal);
+                if (e < 0 && base + cnt > (int)blockIdx.y) {
+                    uint32_t m = bal;
+                    for (int t = 0; t < (int)blockIdx.y - base; ++t) m &= m - 1u;
+                    const int l = __ffs((int)m) - 1;
+                    e = e0 + u * kWave + l;
+                    rs = __builtin_amdgcn_readlane(o0[u], l);
+                    re = __builtin_amdgcn_readlane(o1[u], l);
+                }
+                base += cnt;
+            }
+        }
+    }
+    if (e < 0) return;
+    re = re < T ? re : T;
+    const int cls = e & 1, e2 = e >> 1;
+    const uint8_t* wbase = r3d_tab_at(tw.w[cls], e2);
+    const int w_ld = tw.w[cls].ld;
+    const uint16_t* wsb = (const uint16_t*)r3d_tab_at(tw.s[cls], e2);
+    const int ws_ld = tw.s[cls].ld;
+    const int col0 = ((int)blockIdx.x * (kLsThreads / kWave) + (int)wave) * kLsCols;
+    if (col0 >= N) return;   /* a wave's own; no barrier follows */
+
+    for (int i = rs; i < re; ++i) {
+        const int src = a_sorted ? i : (sorted[i] >= 0 ? sorted[i] / top_k : -1);
+        if (src < 0 || src >= a_rows) continue;
+        /* the lane's activation, NCH chunks of eight codes as four exact f16 pairs, and its
+         * activation scale a chunk (group 128 of the activation) */
+        uint32_t af[NCH][4];
+        float sa[NCH];
+        const uint8_t* ar = a + (size_t)src * a_ld + 8 * lane;
+#pragma unroll
+        for (int c = 0; c < NCH; ++c) {
+            const uint2 x = *(const uint2*)(ar + 256 * c);
+            af[c][0] = e4m3x2_f16x2(__builtin_amdgcn_perm(x.x, x.x, 0x010c000cu));
+            af[c][1] = e4m3x2_f16x2(__builtin_amdgcn_perm(x.x, x.x, 0x030c020cu));
+            af[c][2] = e4m3x2_f16x2(__builtin_amdgcn_perm(x.y, x.y, 0x010c000cu));
+            af[c][3] = e4m3x2_f16x2(__builtin_amdgcn_perm(x.y, x.y, 0x030c020cu));
+            sa[c] = a_scale[(size_t)src * as_ld + (256 * c + 8 * (int)lane) / kGroup];
+        }
+        for (int cc = 0; cc < kLsCols; cc += 2) {
+            uint32_t wv[2][NCH];
+            float sw[2][NCH];
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                int n = col0 + cc + q;
+                n = n < N ? n : N - 1;
+                const uint8_t* wp = wbase + (size_t)n * w_ld / 2 + 4 * lane;
+                const uint16_t* sp = wsb + (size_t)n * ws_ld;
+#pragma unroll
+                for (int c = 0; c < NCH; ++c) {
+                    wv[q][c] = __builtin_nontemporal_load((const uint32_t*)(wp + 128 * c));
+                    sw[q][c] = bf16_f32(sp[(256 * c + 8 * (int)lane) / WG]);
+                }
+            }
+#pragma unroll
+            for (int q = 0; q < 2; ++q) {
+                float acc = 0.f;
+#pragma unroll
+                for (int c = 0; c < NCH; ++c) {
+                    const uint32_t x = wv[q][c] ^ 0x88888888u;
+                    const uint32_t lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
+                    float d = 0.f;
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) {
+                        const uint32_t hb = __builtin_amdgcn_perm(hi, lo, 0x0c040c00u + 0x00010001u * k) | 0x64006400u;
+                        const h2 hv = __builtin_bit_cast(h2, hb) - h2{ (_Float16)1032.0f, (_Float16)1032.0f };
+                        d = __builtin_amdgcn_fdot2(__builtin_bit_cast(h2, af[c][k]), hv, d, false);
+                    }
+                    acc = acc + (d * sa[c]) * sw[q][c];
+                }
+                acc = wave_sum(acc);
+                const int n = col0 + cc + q;
+                if (lane == 0 && n < N) y[(size_t)i * y_ld + n] = f32_to_bf16(acc);
+            }
+        }
+    }
+}
+
+}  // namespace
+
 extern "C" {
 
 /* moe_gemm_q dtype w4a8: the grouped int4 GEMM. The arm is picked by the activation dtype (int8 ->
@@ -538,6 +658,37 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
                          (unsigned)(c.T < c.n_expert ? c.T : c.n_expert));
         const size_t lds = (size_t)kGvRows * c.K * 2;
         const uint8_t* pa8 = (const uint8_t*)r3d_p(c.a);
+        /* The lane-split form at the two widths it is instantiated for (the 26B-A4B's gate_up and
+         * down), weight group 128: gate_up 37.8 -> 31.1 us, down 24.9 -> 21.2 a launch (cold
+         * routings, RX 7900 XT); the 26B-A4B's decode 87.8 -> 91.8 tok/s. Elsewhere the
+         * run-a-block GEMV.
+         *
+         * Group 32 was left on the run-a-block GEMV when the split form's gate_up measured rel_l2
+         * 1.3e-4 against libref there. That is the order of summation and no error: one output
+         * that lands on the other side of a bf16 rounding boundary moves the rel_l2 of one token's
+         * 12288 outputs by 3.5e-5 to 7.0e-5 times its size over the rms. With the split form
+         * forced at group 32, 40 seeded batches of one and four tokens had no output of either
+         * form, at either group, further from the exact sum than f32 summation in another order
+         * allows, while single batches reached 7e-5 to 8e-5 on one output of 1.4 to 1.8 times the
+         * rms: the split form at both groups, the run-a-block GEMV at group 128, and libref's
+         * order itself against the sum in f64. So the split form's numbers are as good at group
+         * 32; it is not instantiated there and has not been timed. */
+        if (wg == 128 && (c.K == 2816 || c.K == 768)) {
+            const dim3 lgrid((unsigned)((c.N + (kLsThreads / kWave) * kLsCols - 1) /
+                                        ((kLsThreads / kWave) * kLsCols)),
+                             (unsigned)(c.T < c.n_expert ? c.T : c.n_expert));
+#define R3D_LS1(WGV, NCHV)                                                                       \
+    R3D_KLAUNCH((moe_w4a8_e4m3_gemv_ls_kernel<WGV, NCHV>), lgrid, dim3(kLsThreads),              \
+                (hipStream_t)s, pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld,    \
+                as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar)
+#define R3D_LS(NCHV)                                                                             \
+    R3D_LS1(128, NCHV)
+            if (c.K == 2816) R3D_LS(11);
+            else             R3D_LS(3);
+#undef R3D_LS
+#undef R3D_LS1
+            return (int)hipGetLastError();
+        }
         if (wg == 32)
             R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<32, kGvCS>), vgrid, dim3(kThreads), lds, (hipStream_t)s,
                           pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,

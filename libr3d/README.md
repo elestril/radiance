@@ -371,6 +371,17 @@ added in ascending group order by a readlane walk. rad-kbench does not reach the
 shape hook describes the activation as int8), so it was checked against libref's
 `ref_moe_gemm_w4a8` with a standalone harness on routed batches (rel_l2 <= 2.4e-6, a few values
 1-20 bf16 ulps off near zero).
+At K 2816 and 768 with weight group 128 (the 26B-A4B's gate_up and down) the decode GEMV splits K
+over the lanes instead (`moe_w4a8_e4m3_gemv_ls_kernel`): a wave takes 32 columns of one run's
+expert, a lane eight k of each 256-wide chunk, one coalesced dword a column a chunk, the
+activation row decoded into registers once, no LDS and no barrier; the lanes' terms are summed by
+the wave butterfly, so the last bits differ from the reference's order (rel_l2 5.6e-7 at M = 1,
+3.1e-6 at M = 4, the same harness). The run-a-block GEMV held 214 VGPRs a lane, one block a compute
+unit, and loaded, waited and computed in rounds: 41.6 us for the gate_up's 17.3 MB alone in a
+decode pass. At group 32 the split form measured rel_l2 1.3e-4 on the gate_up against libref. That
+is the order of summation, one output on the other side of a bf16 rounding boundary (the launch's
+comment has the measurement). The split form is not instantiated or timed at group 32, so
+the QAT container keeps the run-a-block GEMV.
 The remaining weight forms (the nl64/nl32 magnitude-table nibbles), the prefill run map and the
 SK/UW/RS passes are outstanding, per its kernel header.
 
