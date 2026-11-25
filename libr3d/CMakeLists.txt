@@ -176,6 +176,15 @@ set(R3D_UNITS
   # The same shape over a block-scaled fp8 weight, decoded to f16 exactly (E4M3's four exponent bits
   # and three mantissa bits are a subset of f16's), and over int8 codes.
   "r3d_gemm_fp8a16_nt_m1|"
+  # Gemma 4 and EmbeddingGemma 2, from libhalo (the halo_ -> r3dh_ rename): dense varlen attention
+  # at head_dim 256 and 512 with GQA and a two-sided window (an encoder's); paged attention at any
+  # window, causal or not, every q_len, at head_dim 256 gqa 2 and 512 gqa 8 over a bf16 cache; the
+  # encoder's small ops (act_mul with gelu_tanh, qk_norm_rope, seg_mean); mul_weight and
+  # logit_softcap.
+  "r3dh_attn_dense_bf16|"
+  "r3dh_attn_paged_window|"
+  "r3dh_encoder_bf16|"
+  "r3dh_elem_bf16|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )

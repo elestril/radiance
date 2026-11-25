@@ -28,7 +28,7 @@ An entry point is `r3d_<op>_<dtype>[_<the geometry it is compiled for>]`: `gemm_
 serves `gemm_nt` at bf16 for M <= 16 and refuses a larger M; `r3d_rope_bf16` serves bf16 QKV in
 place and refuses anything else. A dimension in a name is a compile-time constant, and the entry
 point rejects a mismatch instead of running. Dimensions shared by the whole library stay out of
-the names: wave32, the attention rows' head size (128), and the target architecture, which
+the names: wave32, the head size of the `attn_paged_*` rows (128), and the target architecture, which
 `rad_plugin_info`'s `build_target` reports, spelled as a device reports its arch, because the
 loader warns when a plugin claims a card the running device is not.
 
@@ -58,7 +58,7 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | --- | --- |
 | `norm` | `rmsnorm_bf16` (optional residual add and multiplier), `rmsnorm_rows_bf16` (the same kernel under the row-form schema), `rmsnorm_f32`, `layernorm_bf16`, `causal_conv1d_bf16` (the causal depthwise convolution with its per-sequence window, width 2 to 8, on `ple_conv`'s kernel without the SiLU) |
 | `elem` | `add` (with `div`, and the broadcast band), `mul`, `silu`, `gelu`, `sigmoid`, `act_mul_{silu,gelu,sigmoid}`, `softmax`, `scale`, `fill` (bf16/f32/i32/i64), `gather_rows`, `scatter_rows`, bf16 and f32 where the op has both, plus seven `cast` pairs and `silu_mul_bf16` |
-| `attn` | `rope_bf16` (neox and gptj, in place over packed QKV), `rope_rows_bf16` (the same kernel under the row-form schema, with the proportional frequency ladder), `kv_store_{bf16,f16,fp8}`, `attn_paged_{bf16,fp8}_{decode,prefill}`: head_dim 128, split-KV combined in the same launch; `rope_bf16` also takes static YaRN (Gemma 4's proportional rotary) |
+| `attn` | `rope_bf16` (neox and gptj, in place over packed QKV), `rope_rows_bf16` (the same kernel under the row-form schema, with the proportional frequency ladder), `kv_store_{bf16,f16,fp8}`, `attn_paged_{bf16,fp8}_{decode,prefill}`: head_dim 128, split-KV combined in the same launch; `rope_bf16` also takes static YaRN (Gemma 4's proportional rotary). From libhalo: `attn_window_h256_gqa2_bf16kv` and `attn_window_h512_gqa8_bf16kv` (paged, any window, causal or not, every q_len, bf16 cache) with their `attn_qrow_*` twins, `attn_dense_h{256,512}_gqa{2,4,8}_bf16` (dense varlen, a two-sided window), `qk_norm_rope_bf16` |
 | `kv` | `kv_len_trim_i32` (per-sequence context lengths less `trim`, the QSA slice's own last row), `qsa_tail_store_bf16` (the QSA indexer's tail into a per-layer linear KV state, ring addressed by position) |
 | `gemm` | `embed_lookup_bf16`, `gemm_nt_bf16_{m16,tiled}`, `gemm_nt_f16_m16`, `gemm_nt_q_fp8a16_m16`, `gemm_nt_q_fp8a8_{m16,tiled}`, `gemm_nt_q_mxfp4a8_{m16,tiled}` (OCP-MXFP4 weight: e2m1 codes, an e8m0 scale per 32 of K), `gemm_nt_q_w2a8_{m16,tiled}` (2-bit and 4-bit grids on the 128x128 tile), `gemm_nt_q_w4a8_m16` (signed int4 weight, decode band), `gemm_nt_q_w4a16asym_m64` and `gemm_nt_q_w5a16_m64` (4- and 5-bit codes against an f16 activation, 1..64 rows on the wave matrix), `gemm_nt_q_w8a8_{m16,m64}` (signed int8 weight, decode band and 17..127 prefill rows on the wave matrix), `gemm_nt_q_i8a8` (the int8 trunk grid, `i8a8` and its rotated twin `i8a8h`: row-major int8 activations with a scale per (row, 128 of K), a bf16 weight scale, every M: an integer-dot GEMV (`v_dot4_i32_iu8`) for M <= 4, the wave matrix to M = 127, a 128x128 tile from M = 128, from M = 256 in the t2 form (a wave a 64x32 patch, K staged 64 deep into double-buffered LDS: 58-72 TOP/s against 35-48 on the 2048-row projections of Nemo and Gemma 4 12B, RX 7900 XT); bit-identical to `quant_dot`), `gemm_nt_q_gated_fp8a8` |
 | `vocab` | `logits_gemm_bf16`: the head, read once per token, as bf16 or as E4M3 codes with a bf16 scale per 128x128 block; the `impl` axis picks the decode (the LDS table, the per-byte ALU formula) |
@@ -67,6 +67,7 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `moe` | `expert_scale_bf16` (the renormalised top-k weight times the expert's per-expert scale, in place), `moe_router_topk_bf16` (softmax top-k, renormalised if `norm`), `moe_router_topk_scatter` (the top-k and the counting sort as one op), `moe_router_sigmoid_topk` (the GLM-style router: sigmoid scores, selection on scores + bias, the kept weights scaled by `route_scale`), `moe_scatter_small` (the routed slots' stable counting sort: one workgroup up to 1024 slots, three passes over 256-slot tiles above), `moe_gather` (fold the expert outputs back to the token, with the optional shared arm), `moe_gemm_q_e4m3` (grouped E4M3 GEMM; the `impl` axis: 16x16 table decode, 16x16 ALU decode, 16x128 block with the F32 scales folded), `moe_gemm_bf16` (unquantised experts, wave matrix), `moe_gemm_mxfp4a8` (canonical MXFP4 experts), `moe_gemm_w4a8` (int8 activation, packed two's-complement int4 experts: the i32 wave matrix, an f32 a-scale per (row, 128 of K) and a bf16 w-scale per (row, `group` of K: 128, or 32), token- and sorted-order `a`), `moe_gemm_w4a4` (int4 activation, packed two's-complement int4 experts: both widen to int8 on the i32 wave matrix, an f32 a-scale and a bf16 w-scale per (row, 128 of K), token- and sorted-order `a`), `row_topk_{bf16,f32}` (the reference files the op under `moe`, so the row does too) |
 | `gdn` | `gdn_kkt_solve_c64` (`A = (I + strict_lower(diag(beta) K K^T e^{g_i-g_j}))^-1` per 64-chunk; libhalo's kernel), `gdn_chunk_scan_k128_v128_c64` (the chunked scan: WY recompute, state recurrence and output in one kernel; libhalo's), `gdn_gated_rmsnorm_h128`, `gdn_gated_norm_had_quant_i8` (the gated norm fused with the rotation and quantiser), `gdn_conv_prep_w4_h128` (causal conv, split, l2norm, gating and the per-chunk gate cumsum in one prefill kernel), `gdn_conv_update_w4_h128` (the same convolution at decode over a rolling conv-state buffer), `gdn_recurrent_update_k128_v128` (the decode-time recurrent state update, per_candidate or anchor; libhalo's), `gdn_conv_recurrent_update_k128_v128` (the convolution and the recurrent update as one decode kernel, q/k/v never materialised; libhalo's) |
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
+| `encoder` | from libhalo: `act_mul_gelu_tanh_bf16`, `seg_mean_bf16`, `mul_weight_bf16`, `logit_softcap_{bf16,f32}` (see [The libhalo ports](#the-libhalo-ports)) |
 
 The table holds 127 rows over 86 schemas; `r3d_selftest` checks every schema slot for slot against
 the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
@@ -430,6 +431,30 @@ planes joined behind one operand, `rad.planes`, sized by `rad_planes_plan` and w
 
 Gains are read in the dtype the checkpoint stores (bf16, f16, f32, i32 or i64), and the kernel's
 arithmetic is the reference's in the reference's order.
+
+## The libhalo ports
+
+Gemma 4 and EmbeddingGemma 2 need ops this library had no row for. They are libhalo's kernels,
+which serve gfx1151, the same wave32 16x16x16 wave-matrix family, carried here with the
+`halo_` -> `r3dh_` rename of identifiers, so a future libhalo change applies here as a diff; a
+file that differs from libhalo's in anything else names the difference in its header. Row names
+are libhalo's, so the cases and recordings agree across the two:
+
+| unit | rows | what for |
+| --- | --- | --- |
+| `r3dh_attn_dense_bf16.hip` | `attn_dense_h256_gqa{2,4,8}_bf16`, `attn_dense_h512_gqa{2,4,8}_bf16` | EmbeddingGemma 2: bidirectional over each input, sliding layers h256/gqa2 with a 513-wide window, full layers h512/gqa4 |
+| `r3dh_attn_paged_window.hip` | `attn_window_h256_gqa2_bf16kv`, `attn_window_h512_gqa8_bf16kv`, `attn_qrow_*` | Gemma 4 26B-A4B at one rank: sliding layers h256/gqa2 with a 1024-token window, full layers h512/gqa8. One entry point, the WMMA kernel for prefill-shaped steps and the scalar split-KV kernel for decode and verify. libhalo instantiates more geometries and caches; each is a line in the unit and a row here |
+| `r3dh_encoder_bf16.hip` | `qk_norm_rope_bf16`, `seg_mean_bf16`, `act_mul_gelu_tanh_bf16` | the per-head q/k/v norm and rotary over the fused row, mean pooling, the gelu_tanh gated activation |
+| `r3dh_elem_bf16.hip` | `mul_weight_bf16`, `logit_softcap_{bf16,f32}` | the two kernels of libhalo's `halo_model_bf16.hip` this library lacked; the rest of that unit duplicates `r3d_model_bf16.hip` |
+
+The headers they read (`r3dh_dt16.h`, `r3dh_attn_args.h`, `r3dh_chain.h`, `r3dh_launch.h`, and
+`R3dhArgs` in `r3dh.h`) are libhalo's under the same rename, except that `r3dh_chain.h`'s acquire
+also empties the GL1 from the scalar path on gfx10 and gfx11 (marked `libr3d:` in the source). The
+chained forms the units carry are never launched: no row here resolves with `chain`.
+
+Checked on an RX 7900 XT (gfx1100) with rad-kbench against libref on EmbeddingGemma 2's bands
+(`-m embeddinggemma2-bf16.rad --max-tok 2048`): every case passed, worst rel_l2 1.5e-3 (the two
+attn_dense rows); qk_norm_rope 1e-4; seg_mean, act_mul, mul_weight bit-exact.
 
 ## The GDN, QSA, and MoE plumbing rows
 

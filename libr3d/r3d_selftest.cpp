@@ -459,6 +459,12 @@ static void check_shapes() {
                           PI("causal", 0), PI("window", 2048), PS("q_dtype", "bf16"),
                           PS("kv_dtype", "fp8_e4m3"), PI("n_head", 32), PI("max_seqs", 8),
                           PI("max_ctx", 262144) } },
+        /* Gemma 4 26B-A4B's sliding layers, q read in place out of the fused projection: 16 query
+         * heads over 8 KV heads at head_dim 256, behind a 1024-token window. */
+        { "attn_paged_qrow", { PI("q_len", 1), PI("head_dim", 256), PI("gqa", 2),
+                               PI("block_size", 16), PI("causal", 1), PI("window", 1024),
+                               PS("q_dtype", "bf16"), PS("kv_dtype", "bf16"), PI("n_head", 16),
+                               PI("ctx", 4096), PI("max_ctx", 262144) } },
         { "row_topk", { PI("M", 1792), PI("N", 130560), PI("R", 16), PS("dtype", "bf16") } },
         { "sample_argmax", { PI("M", 2048), PI("n_vocab", 130560) } },
         { "sample_temp", { PI("M", 2048), PI("n_vocab", 130560) } },
@@ -773,6 +779,13 @@ static void fill_plane(const RadOpdDesc& d, uint8_t* p, size_t nel, uint32_t see
                        : (d.dtype == RAD_U4 || d.dtype == RAD_I4 || d.dtype == RAD_FP4E2M1) ? nel / 2
                        : nel * dt_bytes(d.dtype);
     std::memset(p, 0, nbyte);
+    if (d.fill == RAD_FILL_INDEX && (d.flags & RAD_OPD_F_IDX_CU) && nel >= 2 && d.idx_max > 0) {
+        /* cu_seqlens: [0, ..., idx_max], the batch cut into nel - 1 equal segments, never a draw
+         * (a random one is not monotone). */
+        for (size_t i = 0; i < nel; ++i)
+            *(int32_t*)(p + i * 4) = (int32_t)((long long)i * d.idx_max / (long long)(nel - 1));
+        return;
+    }
     if (d.fill == RAD_FILL_INDEX) {
         const long long mx = d.idx_const >= 0 ? d.idx_const
                            : (d.idx_max > 0 ? d.idx_max : (long long)nel);
@@ -857,6 +870,9 @@ static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
         if (sp.key && !std::strcmp(sp.key, "block_size")) out.ival = 32;
         if (sp.key && !std::strcmp(sp.key, "gqa")) out.ival = 1;
         if (sp.key && !std::strcmp(sp.key, "q_len")) out.ival = 1;
+        /* q at its own row pitch takes more than one row to test (see run_row). */
+        if (sp.key && !std::strcmp(sp.key, "q_len") && !std::strncmp(k->op, "attn_paged_qrow", 15))
+            out.ival = 3;
         if (sp.key && !std::strcmp(sp.key, "causal")) out.ival = 1;
         if (sp.key && !std::strcmp(sp.key, "window")) out.ival = -1;
         if (sp.key && !std::strcmp(sp.key, "n")) out.ival = 4096;
@@ -2572,12 +2588,28 @@ static int run_row(int i) {
         t.rank = d.rank;
         for (uint32_t r = 0; r < d.rank; ++r) t.shape[r] = d.shape[r];
         /* Sub-byte dtypes count elements, not bytes: fp4_e2m1 packs two a byte. */
-        const size_t bytes = d.dtype == RAD_U2 ? (size_t)(nel / 4)
-                         : (d.dtype == RAD_U4 || d.dtype == RAD_I4 || d.dtype == RAD_FP4E2M1)
-                             ? (size_t)(nel / 2)
-                         : (size_t)nel * dt_bytes(d.dtype);
+        size_t bytes = d.dtype == RAD_U2 ? (size_t)(nel / 4)
+                     : (d.dtype == RAD_U4 || d.dtype == RAD_I4 || d.dtype == RAD_FP4E2M1)
+                         ? (size_t)(nel / 2)
+                     : (size_t)nel * dt_bytes(d.dtype);
         std::vector<uint8_t> h(bytes ? bytes : 1);
         fill_plane(d, h.data(), (size_t)nel, 0x9E3779B9u + (uint32_t)o * 7919u);
+        /* attn_paged_qrow reads q as a column slice of a wider row (the q part of a fused [q|k|v]
+         * projection), which a description cannot state: it gives q's extents, not its pitch. So
+         * q's rows are laid a row of NaN apart, and a kernel that walks q densely reads the NaN
+         * and fails the read-back below. */
+        long long q_pitch = 0;
+        if (o == 0 && !std::strncmp(k->op, "attn_paged_qrow", 15) && d.dtype == RAD_BF16 &&
+            d.rank >= 2) {
+            const size_t row = bytes / (size_t)d.shape[0];
+            std::vector<uint8_t> wide(2 * bytes);
+            for (size_t e = 0; e < wide.size(); e += 2) { wide[e] = 0xC0; wide[e + 1] = 0x7F; }
+            for (long long m = 0; m < d.shape[0]; ++m)
+                std::memcpy(&wide[(size_t)m * 2 * row], &h[(size_t)m * row], row);
+            h.swap(wide);
+            bytes = h.size();
+            q_pitch = 2 * (nel / d.shape[0]);
+        }
         /* TODO: pre-fill output planes with the dtype's NaN, to catch a shim that returns RAD_OK
          * without launching. Doing so makes `quant_act_i8_bf16` and `sample_logprobs_f32` die on
          * signal 11 in the spawned child (both pass with `--case`); both write planes the
@@ -2591,6 +2623,7 @@ static int run_row(int i) {
         t.data = p;
         long long acc = 1;
         for (int r = (int)t.rank - 1; r >= 0; --r) { t.stride[r] = acc; acc *= t.shape[r]; }
+        if (q_pitch) t.stride[0] = q_pitch;
         c.t[o] = t;
     }
 launched:

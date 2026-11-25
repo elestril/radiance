@@ -321,6 +321,12 @@ int r3d_shape_gemm_nt_q_mxfp4a8(const RadParam* p, int n_p, int operand, RadOpdD
 /* --- r3d_shapes.cpp: the fused-op, attention and sampler shape hooks --- */
 extern "C" int r3d_shape_silu_mul          (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_attn_paged        (const RadParam*, int, int, RadOpdDesc*);
+/* The libhalo ports' operand descriptions (r3d_shapes.cpp, libref's). */
+extern "C" int r3d_shape_attn_dense        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_qk_norm_rope      (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_seg_mean          (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_mul_weight        (const RadParam*, int, int, RadOpdDesc*);
+extern "C" int r3d_shape_logit_softcap     (const RadParam*, int, int, RadOpdDesc*);
 extern "C" int r3d_shape_gemm_nt_q_gated (const RadParam*, int, int, RadOpdDesc*);
 /* r3d_gemm_nt_q_w2a8.hip: the w2a8 vocab projection's layout hook, one of the library's three
  * (with the fp8 weight's and the logits head's, below). It repacks nothing: it presents the

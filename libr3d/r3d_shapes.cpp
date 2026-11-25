@@ -998,3 +998,69 @@ int r3d_shape_sample_typical(const RadParam* p, int n_p, int o, RadOpdDesc* out)
 int r3d_shape_sample_xtc(const RadParam* p, int n_p, int o, RadOpdDesc* out) {
     return r3d_shape_narrow(p, n_p, o, out);
 }
+
+/* ==================================================================== r3dh_attn_dense_bf16.hip,
+ * r3dh_encoder_bf16.hip, r3dh_elem_bf16.hip
+ *
+ * libref's descriptions (ref_shapes.cpp), at one sequence: attn_dense picks `gqa` query heads over
+ * one KV head, the smallest geometry that exercises the grouping, as libref does. */
+extern "C" int r3d_shape_attn_dense(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), hd = gi(p, n_p, "head_dim", 0), gqa = gi(p, n_p, "gqa", 1);
+    if (M <= 0 || hd <= 0 || gqa <= 0 || gi(p, n_p, "cu_div", 1) != 1) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const RadOpdDesc list[] = {
+        opd(D, M, gqa, hd),                                   /* q */
+        opd(D, M, 1, hd),                                     /* k */
+        opd(D, M, 1, hd),                                     /* v */
+        opd_idx(2, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),        /* cu_seqlens: [0, M] */
+        opd(D, M, gqa, hd),                                   /* out */
+    };
+    R3D_PICK(list);
+}
+
+/* The contiguous fused [q|k|v] row, positions [M] (none without a rotation), both gains a row of
+ * head_dim. */
+extern "C" int r3d_shape_qk_norm_rope(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), hd = gi(p, n_p, "head_dim", 0);
+    const int64_t nh = gi(p, n_p, "n_head", 0), nkv = gi(p, n_p, "n_head_kv", nh);
+    if (M <= 0 || hd <= 0 || nh <= 0) return RAD_E_UNSUPPORTED;
+    const char* mode = gs(p, n_p, "mode");
+    if (mode && std::strcmp(mode, "neox") && std::strcmp(mode, "gptj")) return RAD_E_UNSUPPORTED;
+    const uint32_t D = act_dt(p, n_p);
+    const RadOpdDesc list[] = {
+        opd(D, M, (nh + 2 * nkv) * hd),                       /* qkv */
+        gi(p, n_p, "rotary_dim", hd) == 0 ? opd_none() : opd_idx(M, 32768),   /* positions */
+        opd(D, hd),                                           /* q_w */
+        opd(D, hd),                                           /* k_w */
+    };
+    R3D_PICK(list);
+}
+
+extern "C" int r3d_shape_seg_mean(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = {
+        opd(D, M, n),                                         /* x */
+        opd_idx(2, M, -1, (uint32_t)RAD_OPD_F_IDX_CU),        /* cu_seqlens: [0, M] */
+        opd(D, 1, n),                                         /* y */
+    };
+    R3D_PICK(list);
+}
+
+extern "C" int r3d_shape_mul_weight(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = {
+        opd(D, M, n),                                         /* x */
+        gi(p, n_p, "scalar", 0) ? opd(D, 1) : opd(D, n),      /* w */
+        opd(D, M, n),                                         /* y */
+    };
+    R3D_PICK(list);
+}
+
+extern "C" int r3d_shape_logit_softcap(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const uint32_t D = act_dt(p, n_p);
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const RadOpdDesc list[] = { opd(D, M, n), opd(D, M, n) };
+    R3D_PICK(list);
+}

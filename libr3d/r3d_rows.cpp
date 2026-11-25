@@ -659,6 +659,35 @@ static const RadOperandSpec oMoeGemmQMod4[] = { { "a", RAD_OPD_IN, 0 }, { "a_sca
                                                 { "y", RAD_OPD_OUT, 0 },
                                                 { "split", RAD_OPD_IN, 1 } };
 
+/* The Gemma ops served by the libhalo ports (r3dh_attn_dense_bf16.hip, r3dh_encoder_bf16.hip,
+ * r3dh_elem_bf16.hip), libref's schemas slot for slot (libref/ref_registry.cpp). */
+static const RadParamSpec pAttnDense[] = { P_INT("M"), P_INT("head_dim"), P_INT("gqa"),
+                                           P_INT("causal"), P_STR("dtype"), P_F64O("scale"),
+                                           P_INTO("max_seqlen"), P_INTO("window"),
+                                           P_INTO("cu_div"), P_INTO("block"),
+                                           P_INTO("window_right") };
+static const RadOperandSpec oAttnDense[] = { { "q", RAD_OPD_IN, 0 }, { "k", RAD_OPD_IN, 0 },
+                                             { "v", RAD_OPD_IN, 0 },
+                                             { "cu_seqlens", RAD_OPD_IN, 0 },
+                                             { "out", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pQkNormRope[] = { P_INT("M"), P_INT("head_dim"), P_INT("n_head"),
+                                            P_INT("n_head_kv"), P_F64("theta"), P_F64("eps"),
+                                            P_F64O("scale"), P_STRO("mode"), P_INTO("rotary_dim"),
+                                            P_F64O("wadd"), P_INTO("v_norm"), P_STRO("sections"),
+                                            P_STRO("comps") };
+static const RadOperandSpec oQkNormRope[] = { { "qkv", RAD_OPD_INOUT, 0 },
+                                              { "positions", RAD_OPD_IN, 1 },
+                                              { "q_w", RAD_OPD_WEIGHT, 1 },
+                                              { "k_w", RAD_OPD_WEIGHT, 1 } };
+static const RadParamSpec pSegMean[] = { P_INT("M"), P_INT("n"), P_STR("dtype") };
+static const RadOperandSpec oSegMean[] = { { "x", RAD_OPD_IN, 0 }, { "cu_seqlens", RAD_OPD_IN, 0 },
+                                           { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pMulWeight[] = { P_INT("M"), P_INT("n"), P_STR("dtype"),
+                                           P_INTO("scalar") };
+static const RadOperandSpec oMulWeight[] = { { "x", RAD_OPD_IN, 0 }, { "w", RAD_OPD_WEIGHT, 0 },
+                                             { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pMnCap[] = { P_INT("M"), P_INT("n"), P_F64("cap"), P_STR("dtype") };
+
 static const RadOpSchema kSchemas[] = {
     SCHEMA("rmsnorm", pRmsNorm, oRmsNorm,
            "y = x * rsqrt(mean(x^2) + eps) * (w + wadd) * mult. `wadd` is GemmaRMSNorm's `1 +`, "
@@ -971,6 +1000,25 @@ static const RadOpSchema kSchemas[] = {
            "Grouped GEMM over the expert-sorted rows, quantised operands, four classes by "
            "expert number mod 4. The E4M3 wave-matrix core over 8 R3dTab tables (class q = "
            "entry e/4 of tables q); unequal class shapes are refused."),
+    SCHEMA("attn_dense", pAttnDense, oAttnDense,
+           "dense attention over cu_seqlens segments (rows cu/cu_div), with attn_paged's window "
+           "rule over a segment's positions and optional blocks of `block` rows that attend "
+           "within themselves."),
+    SCHEMA("qk_norm_rope", pQkNormRope, oQkNormRope,
+           "In place over a fused [q | k | v] row: each q and k head RMS-normed against its gain "
+           "(plus wadd) and rounded, then rotated (neox or gptj, rotary_dim of head_dim); with "
+           "v_norm each v head is RMS-normed with a unit gain and not rotated."),
+    SCHEMA("seg_mean", pSegMean, oSegMean,
+           "Row s of y is the mean of x's rows [cu_seqlens[s], cu_seqlens[s+1]), summed in f64 "
+           "and rounded once; an empty segment is zeros."),
+    SCHEMA("mul_weight", pMulWeight, oMulWeight,
+           "y = x * w, `w` a WEIGHT of one element (a scalar for the whole output) or of one row "
+           "(broadcast down the rows): a learned gain on an activation. f32 product, rounded once."),
+    SCHEMA("logit_softcap", pMnCap, oUnary,
+           "y = cap * tanh(x / cap); the final-logit softcap. `cap` is required and > 0."),
+    SCHEMA("attn_paged_qrow", pAttnPaged, oAttnPaged,
+           "attn_paged, parameter for parameter and value for value, with q read at its own row "
+           "pitch: a column slice of a wider row (the q part of a fused [q|k|v] projection)."),
 };
 
 extern "C" int rad_kernel_schema_count(void) {
@@ -1651,6 +1699,46 @@ static constexpr RadKernelInfo iqr_gate(const char* name, const RadConstraint (&
               r3dh_moe_iqr_shape, r3dh_moe_iqr_unrelayout};
 }
 #endif
+
+/* The libhalo ports' shims (r3dh_*.hip, the halo_ -> r3dh_ rename). */
+extern "C" int r3dh_rad_attn_dense(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_qk_norm_rope(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_seg_mean(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_act_mul(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_mul_weight(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_logit_softcap(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h256_gqa2_bf16(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s);
+extern "C" int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs* a);
+extern "C" int64_t r3dh_rad_attn_window_h512_scratch(const RadArgs* a);
+
+/* attn_dense: one row a compiled (head_dim, gqa); gqa 8 serves any multiple of eight as several
+ * workgroups over one KV head. */
+static const RadConstraint cAttnDenseH256G2[] = { C_EQ("head_dim", 256), C_EQ("gqa", 2),
+                                                  C_IN("dtype", "bf16") };
+static const RadConstraint cAttnDenseH256G4[] = { C_EQ("head_dim", 256), C_EQ("gqa", 4),
+                                                  C_IN("dtype", "bf16") };
+static const RadConstraint cAttnDenseH256G8[] = { C_EQ("head_dim", 256), C_DIV("gqa", 8),
+                                                  C_IN("dtype", "bf16") };
+static const RadConstraint cAttnDenseH512G2[] = { C_EQ("head_dim", 512), C_EQ("gqa", 2),
+                                                  C_IN("dtype", "bf16") };
+static const RadConstraint cAttnDenseH512G4[] = { C_EQ("head_dim", 512), C_EQ("gqa", 4),
+                                                  C_IN("dtype", "bf16") };
+static const RadConstraint cAttnDenseH512G8[] = { C_EQ("head_dim", 512), C_DIV("gqa", 8),
+                                                  C_IN("dtype", "bf16") };
+/* A head in a wave's registers with a rotary pair in one lane: head_dim up to 1024; the shim
+ * refuses a neox head_dim that is not a multiple of 32 by name. */
+static const RadConstraint cQkNormRope[] = { C_LE("head_dim", 1024), C_DIV("head_dim", 2) };
+static const RadConstraint cActGeluTanh[] = { C_IN("act", "gelu_tanh"), C_IN("dtype", "bf16") };
+/* The windowed paged kernels: block_size 16, any window, causal or not, every q_len. */
+static const RadConstraint cWinH256G2Bf16[] = { C_EQ("head_dim", 256), C_EQ("gqa", 2),
+                                                C_EQ("block_size", 16), C_GE("causal", 0),
+                                                C_GE("window", 0), C_IN("q_dtype", "bf16"),
+                                                C_IN("kv_dtype", "bf16") };
+static const RadConstraint cWinH512G8Bf16[] = { C_EQ("head_dim", 512), C_EQ("gqa", 8),
+                                                C_EQ("block_size", 16), C_GE("causal", 0),
+                                                C_GE("window", 0), C_IN("q_dtype", "bf16"),
+                                                C_IN("kv_dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
 #ifdef R3D_DENSE_IQR
@@ -3235,7 +3323,138 @@ static const RadKernelInfo kKernels[] = {
   nullptr, nullptr, r3d_rad_gemm_nt_bf16_tiled, nullptr,
   nullptr, nullptr, r3d_shape_gemm_nt },
 
-
+/* ------------------------------------------------------------------ the libhalo ports
+ *
+ * libhalo's kernels for gfx1151 (the same wave32 16x16x16 WMMA family), carried here with the
+ * halo_ -> r3dh_ rename for Gemma 4 and EmbeddingGemma 2 on every gfx11 card: the rows are
+ * libhalo's, name for name, so rad-kbench and the cases agree across the two libraries.
+ */
+{ "attn_dense_h256_gqa2_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 256, two query heads a KV head in one workgroup, the key range cut to the window",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH256G2), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "attn_dense_h256_gqa4_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 256, four query heads a KV head in one workgroup, the key range cut to the window",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH256G4), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "attn_dense_h256_gqa8_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 256, eight query heads a KV head in one workgroup (a multiple of eight as several), the key range cut to the window",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH256G8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "attn_dense_h512_gqa2_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 512, split across two waves, two query heads a KV head in one workgroup",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH512G2), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "attn_dense_h512_gqa4_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 512, split across two waves, four query heads a KV head in one workgroup",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH512G4), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "attn_dense_h512_gqa8_bf16", "attn_dense", "attn",
+  "dense varlen attention over cu_seqlens: bidirectional with an optional two-sided window, or "
+  "causal with an optional window behind",
+  "head_dim 512, split across two waves, eight query heads a KV head in one workgroup (a multiple of eight as several workgroups)",
+  "bf16 query / key / value / out, f16 operands, fp32 accumulate",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cAttnDenseH512G8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_dense, nullptr, nullptr, nullptr, r3d_shape_attn_dense },
+{ "qk_norm_rope_bf16", "qk_norm_rope", "attn",
+  "per-head RMS norm of q and k (and optionally v, unit gain) with rotary on q and k, in place",
+  "head_dim up to 1024, a multiple of 32 for neox (rotary_dim / 2 a multiple of 32) and gptj; one "
+  "workgroup a token and a wave a head, sin/cos computed once for all its heads",
+  "bf16 qkv, bf16 or f32 gains, i32 positions, f32 arithmetic, the norm rounded before the "
+  "rotation",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cQkNormRope), NOTUNE,
+  nullptr, nullptr, r3dh_rad_qk_norm_rope, nullptr, nullptr, nullptr, r3d_shape_qk_norm_rope },
+{ "seg_mean_bf16", "seg_mean", "elem",
+  "mean pooling: one row a cu_seqlens segment",
+  "any n; 32 columns by 8 row lanes a workgroup, one workgroup row a segment",
+  "bf16 in and out, f64 sum, one rounding",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r3dh_rad_seg_mean, nullptr, nullptr, nullptr, r3d_shape_seg_mean },
+{ "act_mul_gelu_tanh_bf16", "act_mul", "elem",
+  "gated activation over two operands: gelu_tanh(a) rounded, times b",
+  "any n; a, b and y each at their own row pitch, so both may be column slices of one buffer",
+  "bf16 in and out, f32 arithmetic, libm tanh",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cActGeluTanh), NOTUNE,
+  nullptr, nullptr, r3dh_rad_act_mul, nullptr, nullptr, nullptr, r3d_shape_act_mul },
+{ "mul_weight_bf16", "mul_weight", "elem",
+  "activation times a learned scalar or one-row gain",
+  "any n; the weight is one element or exactly n",
+  "bf16 in and out, a bf16 or f32 weight, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r3dh_rad_mul_weight, nullptr, nullptr, nullptr, r3d_shape_mul_weight },
+{ "logit_softcap_bf16", "logit_softcap", "elem",
+  "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
+  "any extent; a row pitch is honoured",
+  "bf16 in and out, fp32 arithmetic",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cBf16Row), NOTUNE,
+  nullptr, nullptr, r3dh_rad_logit_softcap, nullptr, nullptr, nullptr, r3d_shape_logit_softcap },
+{ "logit_softcap_f32", "logit_softcap", "elem",
+  "cap * tanh(x / cap), the final-logit softcap, a row spread over up to 64 blocks",
+  "any extent; a row pitch is honoured",
+  "f32 in and out: the logits as the head's GEMM hands them to the sampler",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cF32Row), NOTUNE,
+  nullptr, nullptr, r3dh_rad_logit_softcap, nullptr, nullptr, nullptr, r3d_shape_logit_softcap },
+{ "attn_window_h256_gqa2_bf16kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen; the WMMA kernel for "
+  "prefill-shaped steps, the scalar one with split-KV for decode and verify",
+  "bf16 query, bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH256G2Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h256_gqa2_bf16, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_qrow_h256_gqa2_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, any window, causal or not",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query (any row pitch), bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH256G2Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h256_gqa2_bf16, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_window_h512_gqa8_bf16kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen; the WMMA kernel for "
+  "prefill-shaped steps, the scalar one with split-KV for decode and verify",
+  "bf16 query, bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G8Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa8_bf16, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_qrow_h512_gqa8_bf16kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, any window, causal or not",
+  "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query (any row pitch), bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G8Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa8_bf16, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
 };
 
 /* ================================================================== the exports
