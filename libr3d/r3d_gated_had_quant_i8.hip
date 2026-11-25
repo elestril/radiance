@@ -112,6 +112,9 @@ int r3d_rad_gated_had_quant_i8(const RadArgs* a, RadStream s)
     if (!r3d_p(gate) || !r3d_wp(q) || !r3d_wp(sc)) return R3D_NO(RAD_E_INVAL);
     if (gate->dtype != RAD_BF16 || q->dtype != RAD_I8 || sc->dtype != RAD_F32)
         return R3D_NO(RAD_E_DTYPE);
+    /* The SiTU softcaps of libref's schema are not applied here. */
+    if (r3d_getf(a, "gate_cap", 0.0) != 0.0 || r3d_getf(a, "up_cap", 0.0) != 0.0)
+        return R3D_NO(RAD_E_UNSUPPORTED);
 
     long long M = 0, n = 0;
     if (r3d_rows_of(q, &M, &n) != 0) return R3D_NO(RAD_E_INVAL);
