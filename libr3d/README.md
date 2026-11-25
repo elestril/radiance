@@ -69,8 +69,9 @@ The table groups the rows by family; `r3d_rows.cpp` and `r3d.h` hold the full se
 | `draft` | `dflash_select_bf16`: the drafter's accept step, a walk over the draft block's candidate lattice |
 | `encoder` | from libhalo: `act_mul_gelu_tanh_bf16`, `seg_mean_bf16`, `mul_weight_bf16`, `logit_softcap_{bf16,f32}` (see [The libhalo ports](#the-libhalo-ports)) |
 
-The table holds 127 rows over 86 schemas; `r3d_selftest` checks every schema slot for slot against
-the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
+The table holds 160 rows over 101 schemas (164 rows built for `gfx1100` alone, which adds the
+dense IQR row and the three routed IQR expert rows); `r3d_selftest` checks every schema slot for
+slot against the `libref.so` beside the plugin. Fourteen rows carry tune axes (see
 [Tunable params](#tunable-params)); the rest are single-implementation.
 
 There are two int8 activation rows because the reference has two ops and they are not
