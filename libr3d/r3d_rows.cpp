@@ -1372,7 +1372,7 @@ static const RadConstraint cQuantCols[] = { C_IN("dtype", "bf16"), C_DIV("n", 8)
 static const RadConstraint cHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
                                               C_DIV("n", 128) };
 static const RadConstraint cGatedHadQuantI8g[] = { C_IN("dtype", "bf16"), C_EQ("group", 128),
-                                                   C_EQ("n", 128) };
+                                                   C_DIV("n", 128) };
 static const RadConstraint cRmsQuantI8[] = { C_IN("dtype", "bf16"), C_DIV("n", 16) };
 /* Not `C_IN("act", "silu sigmoid")`: `act` is optional on the op (a graph may carry libref's
  * integer `mode` instead, and libref defaults to silu), so a band with neither would match no row.
@@ -2068,9 +2068,10 @@ static const RadKernelInfo kKernels[] = {
 
 { "gated_had_quant_i8g_bf16", "gated_had_quant_i8g", "quant",
   "a gated product (silu or sigmoid), a 128-wide block Hadamard, then per-group int8",
-  "n == group == 128 (single-group form, the FWHT runs once per wave so its DPP stages stay out of "
-  "a loop); the gated product in fp32, the codes row-major for the i8a8 dot2 GEMM, the scale "
-  "carrying the 1/sqrt(128)",
+  "group 128, n a multiple of it; the FWHT runs once per wave so its DPP stages stay out of a "
+  "loop. n == 128: one row a workgroup, the gated product in fp32, the scale carrying the "
+  "1/sqrt(128). n > 128: one wave per (row, group), libhalo's numbers (the product rounded to "
+  "bf16, then had_quant_act_i8g's scale amax / 127, out_bf16 unrotated). Codes row-major",
   "bf16 gate_up [M,2n], int8 codes (row-major), f32 scale per group, optional bf16 product",
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cGatedHadQuantI8g), NOTUNE,
