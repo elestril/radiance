@@ -444,6 +444,12 @@ int r3d_rad_silu_mul             (const RadArgs* a, RadStream s);
 int r3d_rad_rmsnorm_quant_fp8    (const RadArgs* a, RadStream s);
 int r3d_shape_rmsnorm_quant_fp8  (const RadParam*, int, int, RadOpdDesc*);
 
+/* --- r3dh_norm_join_bf16.hip: Gemma 4's sandwich-norm joins --- */
+int r3d_shape_norm_add_norm          (const RadParam*, int, int, RadOpdDesc*);
+int r3d_shape_norm_add_norm_route    (const RadParam*, int, int, RadOpdDesc*);
+int r3d_shape_norm_add_norm_route_i8g(const RadParam*, int, int, RadOpdDesc*);
+int r3d_shape_join_add_scale         (const RadParam*, int, int, RadOpdDesc*);
+
 }  /* extern "C" */
 
 #endif  /* RAD_R3D_PLUGIN_H */

@@ -428,6 +428,16 @@ static void check_shapes() {
                        PS("dtype", "fp8_e4m3") } },
         { "rmsnorm_quant_fp8", { PI("M", 1792), PI("n", 5120), PF("eps", 1e-5), PI("group", 128),
                                  PS("dtype", "bf16") } },
+        /* Gemma 4 26B-A4B's sandwich joins: 2816 wide, the routed arm's codes a scale a 128
+         * columns, the router's row scaled by hidden^-0.5. */
+        { "norm_add_norm", { PI("M", 8), PI("n", 2816), PF("eps", 1e-6), PS("dtype", "bf16") } },
+        { "norm_add_norm_route", { PI("M", 8), PI("n", 2816), PF("eps", 1e-6),
+                                   PS("dtype", "bf16"), PF("mult", 0.018844459),
+                                   PI("group", 128) } },
+        { "norm_add_norm_route_i8g", { PI("M", 8), PI("n", 2816), PF("eps", 1e-6),
+                                       PS("dtype", "bf16"), PF("mult", 0.018844459),
+                                       PI("group", 128) } },
+        { "join_add_scale", { PI("M", 8), PI("n", 2816), PF("eps", 1e-6), PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "bf16") } },
         { "gemm_nt", { PI("M", 8), PI("N", 11008), PI("K", 4096), PS("dtype", "f16") } },
         { "gemm_nt_q", { PI("M", 8), PI("N", 11008), PI("K", 4096), PI("group", 128),

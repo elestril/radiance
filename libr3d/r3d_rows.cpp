@@ -342,6 +342,24 @@ static const RadOperandSpec oCausalConv[] = {
     { "y",            RAD_OPD_OUT,    0 },
 };
 
+/* Gemma 4's sandwich-norm joins (r3dh_norm_join_bf16.hip, libhalo's): the schemas are libhalo's,
+ * slot for slot (libref has no row for these ops, so the first library to declare them fixes it). */
+static const RadParamSpec pNormJoin[] = { P_INT("M"), P_INT("n"), P_F64("eps"), P_STR("dtype") };
+static const RadOperandSpec oNormAddNorm[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w_a", RAD_OPD_WEIGHT, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "w_y", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 } };
+static const RadParamSpec pNormAddNormRoute[] = { P_INT("M"), P_INT("n"), P_F64("eps"),
+                                                  P_STR("dtype"), P_F64("mult"), P_INT("group") };
+static const RadOperandSpec oNormAddNormRoute[] = {
+    { "a", RAD_OPD_IN, 0 }, { "w_a", RAD_OPD_WEIGHT, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "w_y", RAD_OPD_WEIGHT, 0 }, { "y", RAD_OPD_OUT, 0 }, { "w_r", RAD_OPD_WEIGHT, 0 },
+    { "r", RAD_OPD_OUT, 0 }, { "w_e", RAD_OPD_WEIGHT, 0 }, { "q", RAD_OPD_OUT, 0 },
+    { "qs", RAD_OPD_OUT, 0 } };
+static const RadOperandSpec oJoinAddScale[] = {
+    { "d", RAD_OPD_IN, 0 }, { "w_d", RAD_OPD_WEIGHT, 0 }, { "r", RAD_OPD_IN, 0 },
+    { "w_r", RAD_OPD_WEIGHT, 0 }, { "w_j", RAD_OPD_WEIGHT, 0 }, { "x", RAD_OPD_INOUT, 0 },
+    { "s", RAD_OPD_WEIGHT, 0 }, { "w_n", RAD_OPD_WEIGHT, 1 }, { "y", RAD_OPD_OUT, 1 } };
+
 static const RadParamSpec pExpertScale[] = { P_INT("M"), P_INT("n_expert"), P_INT("top_k"),
                                              P_STR("dtype") };
 static const RadOperandSpec oExpertScale[] = { { "ids", RAD_OPD_IN, 0 },
@@ -865,6 +883,28 @@ static const RadOpSchema kSchemas[] = {
             "gdn_conv_update followed by gdn_recurrent_update, with q, k and v never written: the "
             "operands are the convolution's (`conv_idx` is its state_idx) and then the recurrence's "
             "without those three."),
+    SCHEMA("norm_add_norm", pNormJoin, oNormAddNorm,
+           "t = rmsnorm(a) * w_a; x = x + t; y = rmsnorm(x) * w_y, over [M, n] rows; every value "
+           "the unfused rmsnorm, add, rmsnorm chain stores is rounded to the activation dtype at "
+           "the same point. A post-norm, the residual add and the next pre-norm (Gemma's "
+           "sandwich)."),
+    SCHEMA("norm_add_norm_route", pNormAddNormRoute, oNormAddNormRoute,
+           "norm_add_norm, then from the same rmsnorm of the x it writes r = rmsnorm(x) * w_r * "
+           "mult and the E4M3 codes q of rmsnorm(x) * w_e with an f32 scale qs per (row, `group` "
+           "columns): rmsnorm_quant_fp8's codes, taken over the bf16-rounded norm. A MoE layer's "
+           "router input and its experts' fp8 input, written by the attention join that already "
+           "holds the norm."),
+    SCHEMA("norm_add_norm_route_i8g", pNormAddNormRoute, oNormAddNormRoute,
+           "norm_add_norm_route with the experts' input as rotated int8: q is "
+           "rmsnorm_had_quant_i8g's codes of rmsnorm(x) * w_e (the bf16-rounded norm, each "
+           "`group` of 128 columns rotated by an unnormalised Hadamard, int8 at a scale qs of "
+           "amax / 127). A MoE layer's router input and its rotated int8 experts' input."),
+    SCHEMA("join_add_scale", pNormJoin, oJoinAddScale,
+           "x = (x + rmsnorm(rmsnorm(d) * w_d + rmsnorm(r) * w_r) * w_j) * s, over [M, n] rows, s "
+           "one element; and with w_n and y, y = rmsnorm(x) * w_n over the x written. Rounding "
+           "where the unfused chain rounds. Two arms' post-norms, their sum, its norm, the residual "
+           "add, a per-layer scalar and the next layer's input norm (Gemma 4's feed-forward "
+           "join)."),
     SCHEMA("expert_scale", pExpertScale, oExpertScale,
            "Each routing weight times its expert's own per-expert scale, in place: the router's "
            "renormalised top-k weight scaled by the [n_expert] table, an out-of-table id reading "
@@ -1364,6 +1404,12 @@ static const RadConstraint cActSigmoid[] = { C_IN("act", "sigmoid"), C_IN("dtype
 static const RadConstraint cFillBf16[] = { C_IN("dtype", "bf16") };
 static const RadConstraint cFillF32[]  = { C_IN("dtype", "f32") };
 static const RadConstraint cDequantW4[] = { C_DIV("N", 16), C_DIV("K", 64) };
+static const RadConstraint cNormJoin[] = {
+    C_GE("n", 1), C_LE("n", 6144), C_IN("dtype", "bf16"),
+};
+static const RadConstraint cNormJoinRoute[] = {
+    C_GE("n", 128), C_LE("n", 6144), C_DIV("n", 128), C_EQ("group", 128), C_IN("dtype", "bf16"),
+};
 static const RadConstraint cRowTopkMerge[] = { C_GE("R", 1), C_LE("R", 32), C_IN("dtype", "f32") };
 static const RadConstraint cNgramIds[] = { C_GE("ngram", 2), C_LE("ngram", 8) };
 
@@ -1733,6 +1779,11 @@ extern "C" int r3dh_rad_mul_weight(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_logit_softcap(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_rmsnorm_p(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gelu_mul(const RadArgs* a, RadStream s);
+/* r3dh_norm_join_bf16.hip: Gemma 4's sandwich-norm joins, libhalo's kernels */
+extern "C" int r3dh_rad_norm_add_norm_bf16(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_norm_add_norm_route_bf16(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_norm_add_norm_route_i8g_bf16(const RadArgs*, RadStream);
+extern "C" int r3dh_rad_join_add_scale_bf16(const RadArgs*, RadStream);
 extern "C" int r3dh_rad_attn_window_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa16_bf16(const RadArgs* a, RadStream s);
@@ -2487,6 +2538,44 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cCausalConv), NOTUNE,
   nullptr, nullptr, r3d_rad_causal_conv1d, nullptr, nullptr, nullptr, nullptr },
+
+/* Gemma 4's sandwich-norm joins (libhalo's, r3dh_norm_join_bf16.hip): one block a row instead of
+ * the rmsnorm / add / mul_weight / rmsnorm_quant_fp8 chain the gemma4 plugin declares where no
+ * library serves them. */
+{ "norm_add_norm_bf16", "norm_add_norm", "norm",
+  "post-norm, residual add, next pre-norm: one block a row, rounding where the chain rounds",
+  "n <= 6144, any M, row pitches honoured",
+  "bf16 activations, f32 gains",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormJoin), NOTUNE,
+  nullptr, nullptr, r3dh_rad_norm_add_norm_bf16, nullptr, nullptr, nullptr,
+  r3d_shape_norm_add_norm },
+{ "norm_add_norm_route_bf16", "norm_add_norm_route", "norm",
+  "norm_add_norm, and the routed arm's router input and fp8 expert input from the same norm",
+  "n <= 6144 in whole 128-column groups, any M, row pitches honoured",
+  "bf16 activations, f32 gains; E4M3 codes with an f32 scale a 128 columns",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormJoinRoute), NOTUNE,
+  nullptr, nullptr, r3dh_rad_norm_add_norm_route_bf16, nullptr, nullptr, nullptr,
+  r3d_shape_norm_add_norm_route },
+{ "norm_add_norm_route_i8g_bf16", "norm_add_norm_route_i8g", "norm",
+  "norm_add_norm, and the routed arm's router input and rotated int8 expert input from the same "
+  "norm",
+  "n <= 6144 in whole 128-column groups, any M, row pitches honoured",
+  "bf16 activations, f32 gains; int8 codes in the 128-wide Hadamard domain with an f32 scale a "
+  "128 columns",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormJoinRoute), NOTUNE,
+  nullptr, nullptr, r3dh_rad_norm_add_norm_route_i8g_bf16, nullptr, nullptr, nullptr,
+  r3d_shape_norm_add_norm_route_i8g },
+{ "join_add_scale_bf16", "join_add_scale", "norm",
+  "two arms' post-norms, sum, norm, residual add, layer scalar: one block a row",
+  "n <= 6144, any M, row pitches honoured",
+  "bf16 activations, f32 gains, bf16 scalar",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cNormJoin), NOTUNE,
+  nullptr, nullptr, r3dh_rad_join_add_scale_bf16, nullptr, nullptr, nullptr,
+  r3d_shape_join_add_scale },
 
 { "expert_scale_bf16", "expert_scale", "moe",
   "Each routing weight times its expert's own per-expert scale, in place",

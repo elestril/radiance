@@ -723,6 +723,47 @@ int r3d_shape_rmsnorm_quant_fp8(const RadParam* p, int n_p, int operand, RadOpdD
     R3D_PICK(list);                          /* x, residual, w, q, scale, out_bf16 */
 }
 
+/* Gemma 4's sandwich-norm joins (r3dh_norm_join_bf16.hip). Activations are bf16 rows of n, every
+ * gain an f32 row of n (the shims refuse another dtype), the layer scalar one bf16 element. */
+extern "C" int r3d_shape_norm_add_norm(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t B = (uint32_t)RAD_BF16, F = (uint32_t)RAD_F32;
+    const RadOpdDesc list[] = { opd(B, M, n), opd(F, n), opd(B, M, n), opd(F, n),
+                                opd(B, M, n) };                 /* a, w_a, x, w_y, y */
+    R3D_PICK(list);
+}
+
+/* The route forms add the router's row and the experts' codes with a scale a `group` columns:
+ * E4M3 codes for norm_add_norm_route, int8 for norm_add_norm_route_i8g. */
+static int norm_route_shape(const RadParam* p, int n_p, int operand, RadOpdDesc* out,
+                            uint32_t codes) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const int64_t group = gi(p, n_p, "group", 0);
+    if (group <= 0 || n % group) return RAD_E_UNSUPPORTED;
+    const uint32_t B = (uint32_t)RAD_BF16, F = (uint32_t)RAD_F32;
+    const RadOpdDesc list[] = { opd(B, M, n), opd(F, n), opd(B, M, n), opd(F, n), opd(B, M, n),
+                                opd(F, n), opd(B, M, n), opd(F, n), opd(codes, M, n),
+                                opd(F, M, n / group) };
+    R3D_PICK(list);                  /* a, w_a, x, w_y, y, w_r, r, w_e, q, qs */
+}
+extern "C" int r3d_shape_norm_add_norm_route(const RadParam* p, int n_p, int operand,
+                                             RadOpdDesc* out) {
+    return norm_route_shape(p, n_p, operand, out, (uint32_t)RAD_F8E4M3);
+}
+extern "C" int r3d_shape_norm_add_norm_route_i8g(const RadParam* p, int n_p, int operand,
+                                                 RadOpdDesc* out) {
+    return norm_route_shape(p, n_p, operand, out, (uint32_t)RAD_I8);
+}
+
+/* `w_n` and `y` are optional and passed: the form with the next norm covers strictly more code. */
+extern "C" int r3d_shape_join_add_scale(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
+    const int64_t M = gi(p, n_p, "M", 0), n = gi(p, n_p, "n", 0);
+    const uint32_t B = (uint32_t)RAD_BF16, F = (uint32_t)RAD_F32;
+    const RadOpdDesc list[] = { opd(B, M, n), opd(F, n), opd(B, M, n), opd(F, n), opd(F, n),
+                                opd(B, M, n), opd(B, 1), opd(F, n), opd(B, M, n) };
+    R3D_PICK(list);                  /* d, w_d, r, w_r, w_j, x, s, w_n, y */
+}
+
 /* Paged attention over one sequence. A context equal to the query length exercises no deep paging,
  * KV split or window, so `ctx` wins when given and is never below the query. `q_len` is the ranged
  * parameter; decode and prefill chunks are different kernels (docs/OPS.md). */

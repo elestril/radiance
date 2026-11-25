@@ -446,6 +446,7 @@ are libhalo's, so the cases and recordings agree across the two:
 | `r3dh_attn_paged_window.hip` | `attn_window_h256_gqa2_bf16kv`, `attn_window_h512_gqa8_bf16kv`, `attn_qrow_*` | Gemma 4 26B-A4B at one rank: sliding layers h256/gqa2 with a 1024-token window, full layers h512/gqa8. One entry point, the WMMA kernel for prefill-shaped steps and the scalar split-KV kernel for decode and verify. libhalo instantiates more geometries and caches; each is a line in the unit and a row here |
 | `r3dh_encoder_bf16.hip` | `qk_norm_rope_bf16`, `seg_mean_bf16`, `act_mul_gelu_tanh_bf16` | the per-head q/k/v norm and rotary over the fused row, mean pooling, the gelu_tanh gated activation |
 | `r3dh_elem_bf16.hip` | `mul_weight_bf16`, `logit_softcap_{bf16,f32}` | the two kernels of libhalo's `halo_model_bf16.hip` this library lacked; the rest of that unit duplicates `r3d_model_bf16.hip` |
+| `r3dh_norm_join_bf16.hip` | `norm_add_norm_bf16`, `norm_add_norm_route_bf16`, `norm_add_norm_route_i8g_bf16`, `join_add_scale_bf16` | Gemma 4's sandwich-norm joins, one launch for each post-norm / residual add / pre-norm chain the gemma4 plugin otherwise declares (with `r3dh_fwht.h` and the current `r3dh_q8.h`); the 26B-A4B's decode pass goes from 935 to 635 dispatches (RX 7900 XT). libref has no row for these ops |
 
 The headers they read (`r3dh_dt16.h`, `r3dh_attn_args.h`, `r3dh_chain.h`, `r3dh_launch.h`, and
 `R3dhArgs` in `r3dh.h`) are libhalo's under the same rename, except that `r3dh_chain.h`'s acquire

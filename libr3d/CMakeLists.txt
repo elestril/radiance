@@ -187,6 +187,8 @@ set(R3D_UNITS
   "r3dh_elem_bf16|"
   # The MoE router's GEMM, top-k and sort in one launch at decode heights (Gemma 4).
   "r3dh_router_gemm_scatter|"
+  # Gemma 4's sandwich-norm joins: one launch for each post-norm / add / pre-norm chain.
+  "r3dh_norm_join_bf16|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )
