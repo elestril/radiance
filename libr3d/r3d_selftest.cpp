@@ -3232,6 +3232,10 @@ static void check_moe_numerics() {
  * A band's M is the step's ceiling: a decode step issues a y of fewer rows and a slot table for
  * those tokens alone, and the launch covers y's rows. The plane behind y is two rows longer than
  * the view here, and those rows must keep their bytes.
+ *
+ * From 256 rows of y the launch is the prefill form (a block eight tokens, one scan of sorted_tok
+ * for them), which must store the bytes of the form below it: 255 and 256 rows are the two sides,
+ * and 300 rows end in a block of four tokens.
  */
 static void check_moe_gather_numerics() {
     std::printf("== moe_gather, by value\n");
@@ -3246,6 +3250,7 @@ static void check_moe_gather_numerics() {
     /* The band's M, y's rows, and whether the shared arm is bound. */
     static const struct { long long M, rows; bool shared; } kCase[] = {
         { 8, 8, false }, { 2048, 1, false }, { 64, 5, true },
+        { 2048, 255, false }, { 2048, 256, false }, { 2048, 300, true },
     };
     const long long TK = 8, NE = 12, n = 704;
     const uint16_t kCanary = 0x7f95;
