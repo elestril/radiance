@@ -420,6 +420,7 @@ static void check_shapes() {
         { "had_quant_act_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
         { "had_quant_act_i8g", { PI("M", 8), PI("n", 7680), PI("group", 128), PS("dtype", "bf16") } },
         { "gated_had_quant_i8g", { PI("M", 8), PI("n", 128), PI("group", 128), PS("dtype", "bf16") } },
+        { "gated_had_quant_i8g", { PI("M", 8), PI("n", 14336), PI("group", 128), PS("dtype", "bf16") } },
         { "rmsnorm_quant_i8", { PI("M", 8), PI("n", 128), PF("eps", 1e-6), PS("dtype", "bf16") } },
         { "gated_quant_fp8", { PI("M", 8), PI("n", 11008), PI("group", 128), PS("dtype", "bf16"),
                                PS("act", "silu") } },
@@ -3674,6 +3675,106 @@ static void check_i8a8_numerics() {
 #endif
 }
 
+/* ---- gated_had_quant_i8g above one group, by value ----------------------------------------------
+ * run_row launches the row once and checks that its planes are finite. Wider than one group the
+ * row is the gated product rounded to bf16, then had_quant_act_i8g over it, one wave per (row,
+ * group); this checks the two steps apart, at two groups and at Mistral Nemo's down_proj input
+ * (14336), for both gates. out_bf16 is compared with a host mirror of the product (silu or sigmoid
+ * of the gate in f32, times up, one bf16 store): the device's expf may differ from the host's in
+ * its last place, so a product may sit one bf16 step from the mirror's. The scales and codes are
+ * then compared with the int8 trunk's mirror above, taken over the bf16 the device stored: the
+ * scale must be exact, and a code may sit one step off where the device's reciprocal differs in
+ * its last place. Row 1 has an all-zero group (scale 1, codes 0). */
+static void check_gated_had_quant_numerics() {
+    std::printf("== gated_had_quant_i8g above one group, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: not run");
+#else
+    using namespace moenum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_gated_had_quant_i8g");
+    if (!fn) { fail("r3d_rad_gated_had_quant_i8g is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    uint32_t st = 0x6A7EDu;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f; };
+
+    for (long long n : { 256LL, 14336LL })
+        for (const char* act : { "silu", "sigmoid" }) {
+            const long long M = 3, G = n / 128;
+            const bool silu = !std::strcmp(act, "silu");
+            char what[96];
+            std::snprintf(what, sizeof(what), "gated_had_quant_i8g %s, n %lld, group 128, 3 rows", act, n);
+            /* A row of gate_up is the gate's n values, then up's. Row 1, group 1: up is zero (the
+             * draw is still taken, so the other values do not move). */
+            std::vector<uint16_t> gu((size_t)(M * 2 * n));
+            const size_t z0 = (size_t)(2 * n + n + 128), z1 = z0 + 128;
+            for (size_t i = 0; i < gu.size(); ++i) {
+                const uint16_t v = f32_to_bf16(rnd() * ((i % 97) == 0 ? 40.0f : 6.0f));
+                gu[i] = i >= z0 && i < z1 ? (uint16_t)0 : v;
+            }
+            std::vector<int8_t> q0((size_t)(M * n), (int8_t)0x55);
+            std::vector<float> s0((size_t)(M * G), -1.0f);
+            std::vector<uint16_t> y0((size_t)(M * n), (uint16_t)0x7fc0);
+            Dev dv;
+            RadTensor t[4] = { dense(dv.put(gu.data(), gu.size() * 2), RAD_BF16, M, 2 * n),
+                               dense(dv.put(q0.data(), q0.size()), RAD_I8, M, n),
+                               dense(dv.put(s0.data(), s0.size() * 4), RAD_F32, M, G),
+                               dense(dv.put(y0.data(), y0.size() * 2), RAD_BF16, M, n) };
+            std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("group", 128), ps("dtype", "bf16"),
+                                        ps("act", act) };
+            RadArgs a{ t, 4, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+            const int rc = fn(&a, nullptr);
+            if (hipDeviceSynchronize() != hipSuccess) { fail("%s: the kernel faulted", what); continue; }
+            if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+            std::vector<int8_t> q(q0.size());
+            std::vector<float> sc(s0.size());
+            std::vector<uint16_t> y(y0.size());
+            if (hipMemcpy(q.data(), t[1].data, q.size(), hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(sc.data(), t[2].data, sc.size() * 4, hipMemcpyDeviceToHost) != hipSuccess ||
+                hipMemcpy(y.data(), t[3].data, y.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+                fail("%s: copying the planes back failed", what); continue; }
+            long long p1 = 0, pworse = 0, off1 = 0, worse = 0, sbad = 0;
+            for (long long r = 0; r < M; ++r)
+                for (long long g = 0; g < G; ++g) {
+                    float v[128];
+                    for (int i = 0; i < 128; ++i) {
+                        const size_t at = (size_t)(r * n + g * 128 + i);
+                        const float xg = bf16_to_f32(gu[(size_t)(r * 2 * n + g * 128 + i)]);
+                        const float up = bf16_to_f32(gu[(size_t)(r * 2 * n + n + g * 128 + i)]);
+                        const float sg = 1.0f / (1.0f + expf(-xg));
+                        const uint16_t want = f32_to_bf16((silu ? xg * sg : sg) * up);
+                        const long long d = std::llabs((long long)want - (long long)y[at]);
+                        if (d == 1) ++p1; else if (d > 1) ++pworse;
+                        v[i] = bf16_to_f32(y[at]);
+                    }
+                    for (int h = 1; h < 128; h <<= 1)
+                        for (int i = 0; i < 128; i += 2 * h)
+                            for (int j = i; j < i + h; ++j) {
+                                const float u = v[j], w = v[j + h];
+                                v[j] = u + w; v[j + h] = u - w;
+                            }
+                    float amax = 0.0f;
+                    for (int i = 0; i < 128; ++i) amax = std::max(amax, std::fabs(v[i]));
+                    const float want = amax > 0.0f ? amax * (1.0f / 127.0f) : 1.0f, inv = 1.0f / want;
+                    if (sc[(size_t)(r * G + g)] != want) ++sbad;
+                    for (int i = 0; i < 128; ++i) {
+                        float c = v[i] * inv;
+                        c = c > 127.0f ? 127.0f : (c < -127.0f ? -127.0f : c);
+                        const long long d = std::llabs((long long)std::nearbyint(c) -
+                                                       (long long)q[(size_t)(r * n + g * 128 + i)]);
+                        if (d == 1) ++off1; else if (d > 1) ++worse;
+                    }
+                }
+            if (sbad == 0 && worse == 0 && pworse == 0 && off1 * 1000 <= M * n && p1 * 1000 <= M * n)
+                ok("%s: every scale exact, %lld of %lld products and %lld codes one step off", what, p1,
+                   M * n, off1);
+            else
+                fail("%s: %lld scales differ; %lld products one bf16 step off, %lld further; %lld codes "
+                     "one step off, %lld further", what, sbad, p1, pworse, off1, worse);
+        }
+#endif
+}
+
 /* ---- a plain weight the host cannot read -------------------------------------------------------
  * The engine maps weights through its own pool (core/device/aql.cpp), and on an integrated GPU (a
  * Radeon 860M) the host cannot read those pages, where hipMalloc's can be. Until 2026-11-18
@@ -3823,6 +3924,7 @@ int main(int argc, char** argv) {
         check_rope_numerics();
     check_attn_depth();
         check_i8a8_numerics();
+        check_gated_had_quant_numerics();
         check_gemm_device_weight();
 
         const int n = rows();
