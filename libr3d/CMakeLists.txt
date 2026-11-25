@@ -183,6 +183,8 @@ set(R3D_UNITS
   # logit_softcap.
   "r3dh_attn_dense_bf16|"
   "r3dh_attn_paged_window|"
+  # libr3d: the same unit at Mistral Nemo's geometry (h128 gqa4), in a code object of its own.
+  "r3dh_attn_paged_window_h128|"
   "r3dh_encoder_bf16|"
   "r3dh_elem_bf16|"
   # The MoE router's GEMM, top-k and sort in one launch at decode heights (Gemma 4).

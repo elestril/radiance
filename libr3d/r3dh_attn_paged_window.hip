@@ -1372,6 +1372,11 @@ static int launch_attn(const RadArgs* a, RadStream stream, bool sink = false) {
 }  /* namespace r3dh_win */
 
 /* ------------------------------------------------------------------ the exported entry points */
+/* libr3d: r3dh_attn_paged_window_h128.hip includes this unit with R3DH_WIN_H128_UNIT for Mistral
+ * Nemo's geometry alone, so its kernels sit in a code object of their own: instantiated here they
+ * moved the Gemma 4 QAT 26B-A4B's single-stream decode from 88.55 to 88.2 tok/s (code placement,
+ * not arithmetic: the Gemma kernels are unchanged). */
+#ifndef R3DH_WIN_H128_UNIT
 extern "C" {
 
 /* The geometries libr3d serves, at the bf16 cache: Gemma 4 26B-A4B's sliding layers (head_dim 256,
@@ -1411,3 +1416,4 @@ int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs*) { return r3dh_win::scr
 int64_t r3dh_rad_attn_window_h512_scratch(const RadArgs*) { return r3dh_win::scratch_need<512>(); }
 
 }  /* extern "C" */
+#endif  /* R3DH_WIN_H128_UNIT */

@@ -32,6 +32,11 @@ enum {
      * prefill, as in libr4d. */
     R3D_PRIO_ATTN_DECODE  = 70,
     R3D_PRIO_ATTN_PREFILL = 60,
+    /* The libhalo window kernel at a geometry the two h128 rows also serve (Mistral Nemo, h128
+     * gqa4), over both of them: its WMMA prefill against a lane a row on the VALU, and its
+     * split-KV decode against attn_paged_bf16_decode, which at four sequences was 13 ms of a
+     * 36 ms decode pass on an RX 7900 XT. */
+    R3D_PRIO_ATTN_WINDOW = 75,
 
     /* The skinny bf16 GEMM's band is M <= 16 and the tiled one's starts at M >= 16. At 16 rows the
      * skinny kernel wins: it keeps the whole weight stream in flight with one wave per row and has

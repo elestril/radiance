@@ -1784,6 +1784,7 @@ extern "C" int r3dh_rad_join_add_scale_bf16(const RadArgs*, RadStream);
 extern "C" int r3dh_rad_attn_window_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa8_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_h512_gqa16_bf16(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h128_gqa4_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_attn_window_ahead_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
@@ -1801,6 +1802,7 @@ extern "C" int r3dh_rad_unrelayout_w4(const RadParam*, int, int, const RadEncodi
                                       const void*, int64_t, const RadTensor*, int);
 extern "C" int r3dh_rad_router_gemm_topk_scatter_init(const RadParam*, int, int, int, void**);
 extern "C" void r3dh_rad_router_gemm_topk_scatter_fini(void* inst);
+extern "C" int64_t r3dh_rad_attn_window_h128_scratch(const RadArgs* a);
 extern "C" int64_t r3dh_rad_attn_window_h256_scratch(const RadArgs* a);
 extern "C" int64_t r3dh_rad_attn_window_h512_scratch(const RadArgs* a);
 
@@ -1866,6 +1868,10 @@ static const RadConstraint cWinH512G16Bf16[] = { C_EQ("head_dim", 512), C_EQ("gq
                                                  C_EQ("block_size", 16), C_GE("causal", 0),
                                                  C_GE("window", 0), C_IN("q_dtype", "bf16"),
                                                  C_IN("kv_dtype", "bf16") };
+static const RadConstraint cWinH128G4Bf16[] = { C_EQ("head_dim", 128), C_EQ("gqa", 4),
+                                                C_EQ("block_size", 16), C_GE("causal", 0),
+                                                C_GE("window", 0), C_IN("q_dtype", "bf16"),
+                                                C_IN("kv_dtype", "bf16") };
 
 static const RadKernelInfo kKernels[] = {
 #ifdef R3D_DENSE_IQR
@@ -3727,6 +3733,17 @@ static const RadKernelInfo kKernels[] = {
   RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
   ROW(cWinH512G16Bf16), NOTUNE,
   nullptr, nullptr, r3dh_rad_attn_window_h512_gqa16_bf16, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, r3d_shape_attn_paged },
+{ "attn_window_h128_gqa4_bf16kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 128, 4 queries per kv head, paged block 16, bf16 query and cache, any q_len, varlen: "
+  "every model of this geometry, measured on Mistral Nemo only; the WMMA kernel for prefill-shaped "
+  "steps, the scalar one with split-KV for decode and verify; outranks attn_paged_bf16_decode and "
+  "attn_paged_bf16_prefill at this geometry",
+  "bf16 query, bf16 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ATTN_WINDOW,
+  ROW(cWinH128G4Bf16), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h128_gqa4_bf16, r3dh_rad_attn_window_h128_scratch,
   nullptr, nullptr, r3d_shape_attn_paged },
 { "attn_qrow_h512_gqa8_bf16kv", "attn_paged_qrow", "attn",
   "paged attention reading q at its own row pitch, any window, causal or not",
