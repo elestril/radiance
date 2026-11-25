@@ -20,11 +20,15 @@
 #include <cstring>
 
 /* One class's table as the kernels read it: the table, the bytes between stacked entries (0 for
- * a pointer array) and the elements between rows of one entry. */
+ * a pointer array) and the elements between rows of one entry. `pad` names the 4 bytes that would
+ * otherwise be padding and is always 0: a kernel gets the table by value, and the pass recorder
+ * compares a recorded pass's kernel arguments byte for byte, so an unset padding byte holds
+ * whatever the stack held and fails the audit at random. */
 struct R3dTab {
     const void* const* tab;
     unsigned long long s0;
     int ld;
+    int pad;
 };
 
 /* Both classes' codes and scales, passed to a kernel by value. Class 1 repeats class 0 when the
@@ -53,6 +57,7 @@ static inline int r3d_tab_of(const RadTensor* t, uint32_t dtype, int bits, long 
     out->tab = (const void* const*)t->data;
     out->s0  = (unsigned long long)((t->stride[0] * (long long)bits) / 8);
     out->ld  = (int)t->stride[1];
+    out->pad = 0;
     return RAD_OK;
 }
 
