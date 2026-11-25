@@ -6,6 +6,8 @@
  *
  *   v_dot2acc_f32_f16       yes, all gfx11, via __builtin_amdgcn_fdot2; dual-issued as
  *                           v_dual_dot2acc_f32_f16 where possible. Carries the matrix work.
+ *   v_dot4_i32_iu8,         yes on gfx1100 (__builtin_amdgcn_sudot4 / sudot8, signs as neg_lo): exact
+ *   v_dot8_i32_iu4          integer dots; the i8a8 decode GEMV uses the first.
  *   v_dot2 with bf16        no. The builtin's bf16 selector is accepted and ignored (the f16
  *                           instruction is emitted), so bf16 is widened.
  *   WMMA                    the assembler rejects every v_wmma_* mnemonic and inline asm fails in
