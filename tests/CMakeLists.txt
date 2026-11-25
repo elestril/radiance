@@ -113,6 +113,13 @@ if(TARGET libr3d)
     set_tests_properties(r3d_moe_w4a8_catalogue PROPERTIES LABELS unit)
     add_test(NAME r3d_moe_w4a8_gpu COMMAND r3d_moe_w4a8_gpu $<TARGET_FILE:libr3d>)
     set_tests_properties(r3d_moe_w4a8_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
+    # r3d_kv_i8_gpu holds the int8 KV cache (kv_store_i8, the windowed attention's int8 rows) to
+    # the bf16 cache on the same keys, values and queries, within the int8 step.
+    add_executable(r3d_kv_i8_gpu r3d_kv_i8_gpu.cpp ../core/util/rad_util.cpp)
+    target_link_libraries(r3d_kv_i8_gpu PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+    add_dependencies(r3d_kv_i8_gpu libr3d)
+    add_test(NAME r3d_kv_i8_gpu COMMAND r3d_kv_i8_gpu $<TARGET_FILE:libr3d>)
+    set_tests_properties(r3d_kv_i8_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
   endif()
 endif()
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
