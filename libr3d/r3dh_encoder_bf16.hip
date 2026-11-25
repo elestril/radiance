@@ -1,7 +1,9 @@
 /* Ported from libhalo/halo_encoder_bf16.hip with the halo_ -> r3dh_ rename (identifiers only), so
  * libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same wave32 16x16x16
- * WMMA family as gfx1100; the unit compiles for the family unchanged. One thing is added to
- * libhalo's file, marked `libr3d:`: act_mul's chained form (r3d_chain.h). */
+ * WMMA family as gfx1100; the unit compiles for the family unchanged. libr3d's changes to
+ * libhalo's file are marked `libr3d:`: the chained forms of act_mul and qk_norm_rope
+ * (r3d_chain.h), and qk_norm_rope's grid of eight heads a block with a fixed-width form at
+ * head_dim 256 and 512. */
 /* Derived from libr4d/r4d_encoder_bf16.hip by the libhalo rename transform (2026-10-26),
  * then ported to gfx1151; see libhalo/README.md. */
 // Small encoder ops between GEMMs and attention: gated activation over two operands, QK(V) norm +
@@ -124,12 +126,22 @@ __device__ __forceinline__ float qk_pos(const void* pos, int pos_f32, size_t i) 
 
 // MODE: 0 neox, 1 gptj, 2 blocks. Positions are [M] for the first two and [C, M] (plane stride
 // `pplane`) for blocks.
-template <int MODE>
+//
+// libr3d: blockIdx.y takes the token's heads eight at a time (a wave a head), each block computing
+// the token's sin/cos itself. One block a token walked its 32 heads four to a wave, each a global
+// round trip, and was 18 us of a 26B-A4B decode layer on an RX 7900 XT; a head's arithmetic is
+// unchanged, so the bytes are. CH is the chained form's tag (r3d_chain.h).
+//
+// EC > 0 (libr3d) fixes head_dim at 32 * EC and the gains' dtype at WF32, so a head's loads are
+// unconditional and go out together: under the run-time `j < E` each load was a branch of its
+// own and the compiler waited on it before the next. The values and their order are the same.
+template <int MODE, class CH = HaloUnchained, int EC = 0, bool WF32 = false>
 __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
     uint16_t* __restrict__ qkv, const void* __restrict__ pos, const void* __restrict__ qw,
     const void* __restrict__ kw, uint32_t head_dim, uint32_t n_head, uint32_t n_head_kv,
     uint32_t rot, int v_norm, float theta, float eps, float rscale, float wadd, uint32_t ld,
     QkBlocks blk, uint32_t pplane, int w_f32, int pos_f32) {
+    R3D_CHAIN_SCOPE(CH);   /* no return; the waves' head loops hold no barrier */
     __shared__ float cs_s[kQkMaxHalf], sn_s[kQkMaxHalf];
     const uint32_t m = blockIdx.x;
     const uint32_t n_rope = n_head + n_head_kv;
@@ -157,28 +169,51 @@ __global__ __launch_bounds__(kQkThreads) void qk_norm_rope_kernel(
     __syncthreads();
 
     const uint32_t lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-    const int E = (int)(head_dim / 32);
+    const int E = EC > 0 ? EC : (int)(head_dim / 32);
     auto at = [&](int j) -> uint32_t {
         return MODE == 1 ? 64u * (uint32_t)(j >> 1) + 2u * lane + (uint32_t)(j & 1)
                          : lane + 32u * (uint32_t)j;
     };
-    for (uint32_t hh = wave; hh < n_norm; hh += kQkThreads / 32) {
+    for (uint32_t hh = blockIdx.y * (kQkThreads / 32) + wave; hh < n_norm;
+         hh += gridDim.y * (kQkThreads / 32)) {
         uint16_t* h = row + hh * head_dim;
         float x[kQkMaxE];
         float ss = 0.0f;
+        const bool is_v = hh >= n_rope;
+        const void* w = hh < n_head ? qw : kw;
+        if constexpr (EC > 0) {
+            /* every load first: the head, and the gain (a unit gain reads the start of the
+             * token's row instead, at least 4 * head_dim bytes of valid memory, and takes 1) */
+            const bool unit = is_v || !w;
+            const void* wl = unit ? (const void*)row : w;
+            float gr[EC];
+            #pragma unroll
+            for (int j = 0; j < EC; ++j) {
+                x[j] = bf2f(h[at(j)]);
+                gr[j] = WF32 ? ((const float*)wl)[at(j)] : bf2f(((const uint16_t*)wl)[at(j)]);
+            }
+            #pragma unroll
+            for (int j = 0; j < EC; ++j) ss += x[j] * x[j];
+            ss = r3dh_wave_sum(ss);
+            const float sc = 1.0f / sqrtf(ss / (float)head_dim + eps);
+            #pragma unroll
+            for (int j = 0; j < EC; ++j) {
+                const float g = unit ? 1.0f : gr[j] + wadd;
+                x[j] = bf2f(f32_to_bf16(x[j] * sc * g));
+            }
+        } else {
         #pragma unroll
         for (int j = 0; j < kQkMaxE; ++j)
             if (j < E) { x[j] = bf2f(h[at(j)]); ss += x[j] * x[j]; }
         ss = r3dh_wave_sum(ss);
         const float sc = 1.0f / sqrtf(ss / (float)head_dim + eps);
-        const bool is_v = hh >= n_rope;
-        const void* w = hh < n_head ? qw : kw;
         #pragma unroll
         for (int j = 0; j < kQkMaxE; ++j)
             if (j < E) {
                 const float g = is_v ? 1.0f : qk_gain(w, at(j), w_f32, wadd);
                 x[j] = bf2f(f32_to_bf16(x[j] * sc * g));
             }
+        }
         if (!is_v) {
             if (MODE == 1) {
                 #pragma unroll
@@ -928,12 +963,39 @@ extern "C" int r3dh_qk_norm_rope_bf16(long qkv, long pos, long qw, long kw, int 
                            pos_f32);
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
+    /* libr3d: eight heads a block (qk_norm_rope_kernel) */
+    const uint32_t n_norm = (uint32_t)(n_head + n_head_kv + (v_norm ? n_head_kv : 0));
+    const dim3 qgrid((uint32_t)M, (n_norm + kQkThreads / 32 - 1) / (kQkThreads / 32));
+    /* ...and neox at head_dim 256 or 512, the gains bf16 or f32, the fixed-width form */
+#define R3DH_QNF(EC, WF)                                                                         \
+    do {                                                                                         \
+        if (r3dh_chain_flag())                                                                   \
+            hipLaunchKernelGGL((qk_norm_rope_kernel<0, r4dchain, EC, WF>), qgrid, dim3(kQkThreads), \
+                               0, (hipStream_t)stream, (uint16_t*)qkv, (const void*)pos,        \
+                               (const void*)qw, (const void*)kw, (uint32_t)head_dim,            \
+                               (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot, v_norm,    \
+                               theta, eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane,     \
+                               w_f32, pos_f32);                                                 \
+        else                                                                                     \
+            hipLaunchKernelGGL((qk_norm_rope_kernel<0, HaloUnchained, EC, WF>), qgrid,         \
+                               dim3(kQkThreads), 0, (hipStream_t)stream, (uint16_t*)qkv,        \
+                               (const void*)pos, (const void*)qw, (const void*)kw,              \
+                               (uint32_t)head_dim, (uint32_t)n_head, (uint32_t)n_head_kv,       \
+                               (uint32_t)rot, v_norm, theta, eps, rscale, wadd, (uint32_t)ld, b, \
+                               (uint32_t)pplane, w_f32, pos_f32);                               \
+    } while (0)
+    if (mode == 0 && (head_dim == 256 || head_dim == 512)) {
+        if (head_dim == 256) { if (w_f32) R3DH_QNF(8, true);  else R3DH_QNF(8, false); }
+        else                 { if (w_f32) R3DH_QNF(16, true); else R3DH_QNF(16, false); }
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
+#undef R3DH_QNF
 #define R3DH_QN(MD)                                                                              \
-    hipLaunchKernelGGL(qk_norm_rope_kernel<MD>, dim3((uint32_t)M), dim3(kQkThreads), 0,         \
-                       (hipStream_t)stream, (uint16_t*)qkv, (const void*)pos, (const void*)qw,  \
-                       (const void*)kw, (uint32_t)head_dim, (uint32_t)n_head,                   \
-                       (uint32_t)n_head_kv, (uint32_t)rot, v_norm, theta, eps, rscale, wadd,    \
-                       (uint32_t)ld, b, (uint32_t)pplane, w_f32, pos_f32)
+    R3D_CHAIN_LAUNCH(qk_norm_rope_kernel, (MD,), qgrid, dim3(kQkThreads), (hipStream_t)stream,  \
+                     (uint16_t*)qkv, (const void*)pos, (const void*)qw, (const void*)kw,        \
+                     (uint32_t)head_dim, (uint32_t)n_head, (uint32_t)n_head_kv, (uint32_t)rot,  \
+                     v_norm, theta, eps, rscale, wadd, (uint32_t)ld, b, (uint32_t)pplane, w_f32, \
+                     pos_f32)
     if (mode == 1)      R3DH_QN(1);
     else if (mode == 2) R3DH_QN(2);
     else                R3DH_QN(0);
@@ -1232,6 +1294,7 @@ static int parse_ints(const char* v, int* out, int max) {
 }
 
 extern "C" int r3dh_rad_qk_norm_rope(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     const RadTensor* qkv = r3dh_opt(a, QN_QKV);
     const RadTensor* pos = r3dh_opt(a, QN_POS);
     const RadTensor* qw  = r3dh_opt(a, QN_QW);

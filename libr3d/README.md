@@ -684,6 +684,17 @@ all-reduce over the host link most of them sit on is slower than sending the byt
 host. Nothing here is built as a chained form, so both optional symbols are omitted, which is the
 ABI's own answer.
 
+**A decode step's small kernels are bound by their instruction fetch.** In a 26B-A4B decode pass
+a one-block kernel's code is cold (the weight stream evicts it between layers), and on an RX 7900
+XT straight-line code runs at about 5-6 ns an instruction there: `kv_store`'s run-time dtype
+switch, inlined sixteen times, was 6200 instructions and 15 us a layer, 990 instructions and 6.7 us
+with the dtype a template constant; `norm_add_norm_route` went from 3400 instructions and 23 us to
+16 us with a branch-free E4M3 encode, and to 6.6 us at 1024 threads a row (three columns a thread
+instead of twelve, unrolled). Count a decode kernel's instructions (`llvm-objdump` of the unit)
+before its arithmetic. A load under a run-time `i < n` is a branch of its own, and the compiler
+waits on it before the next (`s_waitcnt vmcnt(0)` after each): load at a clamped index and zero
+the padding after.
+
 ## What is not here yet
 
 **The seeded draw against a recording.** The fixture checks the plane whole, not the draw against a

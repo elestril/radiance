@@ -617,7 +617,9 @@ __global__ __launch_bounds__(kThreads) void moe_w4a8_e4m3_pf_kernel(
  * fdot2's one rounding a pair (the dot2 rows' documented difference, README "Numerics"). A dropped
  * token-order slot (sorted < 0) is left as the caller set it, as in the reference; a sorted-order
  * row is computed. */
-constexpr int kGvRows = 4;              // activation rows a pass over LDS
+constexpr int kGvRows = 1;              // activation rows a pass over LDS: one, so a block's LDS is
+                                        // K f16 rather than four rows (gate_up at the 26B-A4B's decode:
+                                        // 40.6 -> 37.8 us a launch, cold routings, RX 7900 XT)
 
 __device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t v)
 {

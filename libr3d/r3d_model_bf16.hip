@@ -729,12 +729,16 @@ __global__ __launch_bounds__(THR) void rope_kernel(
  * the multiply is exact there. For the fp8 cache a value times 1/scale differs from ref's result by
  * at most the reciprocal's rounding, far below the fp8 code step.
  */
-template <int THR>
+/* KVDT (libr3d): the cache's dtype as a template constant, so each element's store is one
+ * instruction rather than st_elem's run-time switch (the switch's every arm, inlined sixteen
+ * times, was a 6000-instruction kernel whose cold instruction fetch cost a decode layer ~10 us). */
+template <int THR, class CH = HaloUnchained, int KVDT = R3D_DT_BF16>
 __global__ __launch_bounds__(THR) void kv_store_kernel(
     const uint16_t* __restrict__ k, const uint16_t* __restrict__ v, const int32_t* __restrict__ sm,
     void* __restrict__ kv, uint32_t head_dim, uint32_t kv_heads, uint32_t block_size, int kv_dt,
     float k_inv, float v_inv, uint32_t k_ld, uint32_t v_ld, int64_t sb, int64_t sh, int64_t so,
     int64_t sd, int64_t slot_max) {
+    R3D_CHAIN_SCOPE(CH);   /* the padding return is the whole block's; no barrier */
     const uint32_t t = blockIdx.x;
     const int32_t s = ldg_i32(sm + t);
     /* A negative slot is padding. A slot at or past the cache's span names a block the cache does
@@ -745,15 +749,30 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
     const uint32_t total = kv_heads * head_dim;
     const uint16_t* __restrict__ kr = k + (size_t)t * k_ld;
     const uint16_t* __restrict__ vr = v + (size_t)t * v_ld;
-    const int es = kv_dt == R3D_DT_BF16 ? 2 : kv_dt == R3D_DT_F16 ? 2 : 1;
+    const int es = KVDT == R3D_DT_BF16 ? 2 : KVDT == R3D_DT_F16 ? 2 : 1;
     char* __restrict__ plane = (char*)kv;
 
-    for (uint32_t j = threadIdx.x; j < total; j += THR) {
-        const uint32_t h = j / head_dim, d = j - h * head_dim;
-        const int64_t cb = (blk * sb + (int64_t)h * sh + off * so) * es;
-        st_elem(kv_dt, plane + cb, (size_t)d * sd, bf16_to_f32(ldg_u16_at(kr, j)) * k_inv);
-        st_elem(kv_dt, plane + cb, (size_t)(head_dim + d) * sd,
-                bf16_to_f32(ldg_u16_at(vr, j)) * v_inv);
+    /* Eight elements a thread a turn, every load issued before the first store: a turn of one
+     * load and its store was a global round trip each, 16 of them in a row at the 26B-A4B's
+     * 2048-wide rows (libr3d, RX 7900 XT). The values stored are the same. */
+    constexpr uint32_t U = 8;
+    for (uint32_t j0 = threadIdx.x; j0 < total; j0 += THR * U) {
+        float kf[U], vf[U];
+#pragma unroll
+        for (uint32_t u = 0; u < U; ++u) {
+            const uint32_t j = j0 + u * THR, jc = j < total ? j : j0;
+            kf[u] = bf16_to_f32(ldg_u16_at(kr, jc));
+            vf[u] = bf16_to_f32(ldg_u16_at(vr, jc));
+        }
+#pragma unroll
+        for (uint32_t u = 0; u < U; ++u) {
+            const uint32_t j = j0 + u * THR;
+            if (j >= total) break;
+            const uint32_t h = j / head_dim, d = j - h * head_dim;
+            const int64_t cb = (blk * sb + (int64_t)h * sh + off * so) * es;
+            st_elem(KVDT, plane + cb, (size_t)d * sd, kf[u] * k_inv);
+            st_elem(KVDT, plane + cb, (size_t)(head_dim + d) * sd, vf[u] * v_inv);
+        }
     }
 }
 
@@ -1342,11 +1361,24 @@ extern "C" int r3d_kv_store(long k, long v, long sm, long kv, int M, int head_di
     if (slot_max <= 0)
         slot_max = (long long)((M + block_size - 1) / block_size + 2) * block_size;
     const int thr = row_threads(n_head_kv * head_dim);
-    R3D_ROW2(kv_store_kernel, thr, M, stream, (const uint16_t*)(uintptr_t)k,
-             (const uint16_t*)(uintptr_t)v, (const int32_t*)(uintptr_t)sm, (void*)(uintptr_t)kv,
-             (uint32_t)head_dim, (uint32_t)n_head_kv, (uint32_t)block_size, kv_dt, k_inv, v_inv,
-             (uint32_t)k_ld, (uint32_t)v_ld, (int64_t)sb, (int64_t)sh, (int64_t)so, (int64_t)sd,
-             (int64_t)slot_max);
+#define R3D_KVS(THR, CHV, DT)                                                                   \
+    R3D_KLAUNCH(R3D_KNAME(kv_store_kernel<THR, CHV, DT>), dim3((uint32_t)M), dim3(THR),         \
+                (hipStream_t)(uintptr_t)(stream), (const uint16_t*)(uintptr_t)k,                 \
+                (const uint16_t*)(uintptr_t)v, (const int32_t*)(uintptr_t)sm,                    \
+                (void*)(uintptr_t)kv, (uint32_t)head_dim, (uint32_t)n_head_kv,                   \
+                (uint32_t)block_size, kv_dt, k_inv, v_inv, (uint32_t)k_ld, (uint32_t)v_ld,       \
+                (int64_t)sb, (int64_t)sh, (int64_t)so, (int64_t)sd, (int64_t)slot_max)
+#define R3D_KVS_DT(THR, CHV)                                                                    \
+    do {                                                                                        \
+        if (kv_dt == R3D_DT_BF16)     R3D_KVS(THR, CHV, R3D_DT_BF16);                           \
+        else if (kv_dt == R3D_DT_F16) R3D_KVS(THR, CHV, R3D_DT_F16);                            \
+        else                          R3D_KVS(THR, CHV, R3D_DT_U8);                             \
+    } while (0)
+    const bool ch = r3dh_chain_flag();
+    if (thr == (int)kNarrow) { if (ch) R3D_KVS_DT(kNarrow, r4dchain); else R3D_KVS_DT(kNarrow, HaloUnchained); }
+    else                     { if (ch) R3D_KVS_DT(kThreads, r4dchain); else R3D_KVS_DT(kThreads, HaloUnchained); }
+#undef R3D_KVS_DT
+#undef R3D_KVS
     return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
@@ -1931,6 +1963,7 @@ extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
  * the kernel drops a slot at or past it.
  */
 extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* k = r3d_opt(a, 0);
     const RadTensor* v = r3d_opt(a, 1);
     const RadTensor* sm = r3d_opt(a, 2);
