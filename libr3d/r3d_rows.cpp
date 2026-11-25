@@ -1838,7 +1838,8 @@ static const RadConstraint cRouterGemmTopkScatter[] = { C_GE("M", 1), C_LE("M", 
                                                         C_IN("dtype", "bf16") };
 /* libhalo's skinny w4a8 GEMM at the symmetric grid, at every M its launcher takes (8192): above
  * 64 rows each 64-row block re-reads the weight. libhalo's tiled prefill form (gemm_w4a8_tiled)
- * disagreed with libref on gfx1100 (rel_l2 ~1 on every case) and is not carried. */
+ * disagreed with libref on gfx1100 (rel_l2 ~1 on every case) and is not carried; from 256 rows
+ * the shim runs libr3d's t2 tile instead (r3dh_gemm_w4a8_nt_m64.hip, "libr3d:"). */
 static const RadConstraint cGemmW4A8M64[] = { C_IN("dtype", "w4a8"), C_GE("M", 1), C_LE("M", 8192),
                                               C_DIV("K", 128), C_DIV("N", 16),
                                               C_EQ("group", R3D_FP8_BLOCK) };
@@ -3608,7 +3609,8 @@ static const RadKernelInfo kKernels[] = {
 { "gemm_w4a8_nt_m64", "gemm_nt_q", "gemm",
   "skinny GEMM with a 4-bit weight and an 8-bit activation, 16x16x16 int8 WMMA, split-K reduced "
   "in LDS",
-  "M <= 8192 (a 64-row block each, re-reading the weight above 64); N a multiple of 16; K "
+  "M <= 8192 (a 64-row block each, re-reading the weight above 64; from 256 rows at the symmetric "
+  "grid a 128x128 tile through double-buffered LDS); N a multiple of 16; K "
   "divisible by SK*128; weight pre-permuted into fragment order "
   "(r4d.w4.frag.g128); activation byte-shuffled inside each k step (quant_act_i8's order)",
   "int8 A with an f32 per-row scale, signed 4-bit W with an f16 scale per 128 K, bf16 C, int32 "

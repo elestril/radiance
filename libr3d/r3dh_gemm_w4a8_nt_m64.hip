@@ -1,6 +1,8 @@
-/* Ported from libhalo/halo_gemm_w4a8_nt_m64.hip, verbatim but for the halo_ -> r3dh_ rename (identifiers only), so
- * libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same wave32 16x16x16
- * WMMA family as gfx1100; the unit compiles for the family unchanged. */
+/* Ported from libhalo/halo_gemm_w4a8_nt_m64.hip with the halo_ -> r3dh_ rename (identifiers
+ * only), so libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same wave32
+ * 16x16x16 WMMA family as gfx1100; the unit compiles for the family unchanged. One thing is added
+ * to libhalo's file, marked `libr3d:`: the symmetric grid's prefill tile from 256 rows (the t2
+ * kernel and the shim's branch to it). */
 /* Derived from libr4d/r4d_gemm_w4a8_nt_m64.hip by the libhalo rename transform (2026-10-26),
  * then ported to gfx1151; see libhalo/README.md. */
 // r3dh_gemm_w4a8_nt_m64.hip - r3dh_gemm_w4a8_nt_m64: 4-bit-weight, 8-bit-activation skinny GEMM for
@@ -309,6 +311,158 @@ __global__ __launch_bounds__(R3DH_W4A8_BOUNDS(NPW)) void r3dh_r4dchain_gemm_w4a8
 }
 #undef R3DH_W4A8_PARAMS
 
+/* libr3d: the symmetric grid's prefill tile, from 256 rows (libr3d's t2 form, as in
+ * r3d_gemm_i8a8.hip). The m64 kernel above reads both fragments from global memory and a block
+ * covers at most 64 rows, so at a 512-row prefill chunk the weight is read eight times and the
+ * 31B's projections ran ~48-50 TOP/s of the wave matrix's 98. Here a block is 128 x 128, eight
+ * waves as 2 x 4 with a 64 x 32 patch each; a 64-K pass (one packed weight block) is staged into
+ * double-buffered LDS in the gfx11 fragment's natural order -- the activation's step dwords
+ * unshuffled (the quantiser writes [w0 w1 | w2 w3] as the two halves' eight bytes), the weight's
+ * nibbles widened by dequant8 and each column's two half-wave dwords interleaved, as dequant_step
+ * assembles them -- so a fragment is one 16-byte LDS read. Each group's i32 sum is exact in any
+ * order and folds as the m64 kernel's does, acc = fmaf(sub, w_scale, acc), in ascending group
+ * order, then v * a_scale * 0.0625 at the store: the m64 kernel's numbers at SK = 1 (at SK > 1 it
+ * adds its slices' partials in slice order, so the two differ in the last bits there). */
+#define R3DH_W4T2_P 80   /* bytes a staged row: 64 + 16, 16-byte aligned */
+__device__ __forceinline__ void w4t2_barrier() {
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+  __builtin_amdgcn_s_barrier();
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+template <bool NT>
+__global__ __launch_bounds__(256) void r3dh_gemm_w4a8_t2_kernel(
+    const signed char* __restrict__ A, const float* __restrict__ Ascale,
+    const unsigned* __restrict__ Wq, const unsigned* __restrict__ Ws,
+    __hip_bfloat16* __restrict__ C, int M, int K, int N) {
+  constexpr int TM = 4, TN = 2, BM = 128, BN = 128, P = R3DH_W4T2_P;
+  __shared__ __attribute__((aligned(16))) unsigned char s_a[2][BM * P];
+  __shared__ __attribute__((aligned(16))) unsigned char s_b[2][BN * P];
+  const int tid = threadIdx.x, lane = tid & 31;
+  const int wave = __builtin_amdgcn_readfirstlane(tid >> 5);
+  const int wm = wave >> 2, wn = wave & 3;
+
+  constexpr unsigned kGroupM = 8;
+  const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+  const unsigned first = lin / per * kGroupM, rr = lin % per;
+  const unsigned gm = min(gridDim.y - first, kGroupM);
+  const int m0 = (int)(first + rr % gm) * BM, n0 = (int)(rr / gm) * BN;
+
+  const int kpb = K / R3DH_GEMM_W4A8_KPB, nsz = K / R3DH_GEMM_W4A8_GROUP;
+  const int ntlast = N / 16 - 1;
+  /* Staging: the activation as a thread a row's 32 bytes (two k steps); the weight as a thread
+   * one lane's 16 bytes of one 16-column tile's packed block. */
+  const int arow = tid >> 1, aseg = (tid & 1) * 32;
+  const int am = m0 + arow < M ? m0 + arow : M - 1;
+  const signed char* asrc = A + (size_t)am * K + aseg;
+  const int bt = tid >> 5, bl = tid & 31;
+  const int btile = (n0 / 16 + bt) < ntlast ? (n0 / 16 + bt) : ntlast;
+  const uint4v* bsrc = (const uint4v*)Wq + (size_t)btile * kpb * WAVE32 + bl;
+  /* The weight lane bl's dwords land at column bt*16 + (bl & 15), the half (bl >> 4) of each
+   * step's interleave. */
+  const int bdst = (bt * 16 + (bl & 15)) * P + 4 * (bl >> 4);
+
+  int wtile[TN];
+#pragma unroll
+  for (int j = 0; j < TN; ++j) {
+    const int t = n0 / 16 + wn * TN + j;
+    wtile[j] = t < ntlast ? t : ntlast;
+  }
+
+  const int np = K / R3DH_GEMM_W4A8_KPB;          /* passes, two a group */
+  uint4v ra[2][2], rb[2];
+  auto issue = [&](int q, uint4v (&xa)[2], uint4v& xb) {
+    const int k0 = q * R3DH_GEMM_W4A8_KPB;
+    xa[0] = *(const uint4v*)(asrc + k0);
+    xa[1] = *(const uint4v*)(asrc + k0 + 16);
+    xb = NT ? __builtin_nontemporal_load(bsrc + (size_t)q * WAVE32) : bsrc[(size_t)q * WAVE32];
+  };
+  auto stage = [&](int buf, const uint4v (&xa)[2], const uint4v& xb) {
+#pragma unroll
+    for (int t = 0; t < 2; ++t)
+      *(uint4v*)(s_a[buf] + arow * P + aseg + 16 * t) = uint4v{ xa[t][0], xa[t][2], xa[t][1], xa[t][3] };
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+      const v2i d = dequant8(xb[st]);
+      *(unsigned*)(s_b[buf] + bdst + 16 * st) = (unsigned)d[0];
+      *(unsigned*)(s_b[buf] + bdst + 16 * st + 8) = (unsigned)d[1];
+    }
+  };
+
+  v8f acc[TM][TN];
+  v8i sub[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) { acc[i][j] = (v8f)(0.f); sub[i][j] = (v8i)(0); }
+  float sc[TN];
+
+  auto step = [&](int p, const int S) {
+    if (p & 1) {
+      /* The group's weight scales (the dword's low half), read at its second pass. */
+#pragma unroll
+      for (int j = 0; j < TN; ++j)
+        sc[j] = __half2float(__ushort_as_half((unsigned short)(
+            Ws[((size_t)wtile[j] * nsz + p / 2) * 16 + (lane & 15)] & 0xFFFFu)));
+    }
+    const unsigned char* fa = s_a[S] + (wm * TM * 16 + (lane & 15)) * P;
+    const unsigned char* fb = s_b[S] + (wn * TN * 16 + (lane & 15)) * P;
+#pragma unroll
+    for (int st = 0; st < 4; ++st) {
+      v4i bq[TN];
+#pragma unroll
+      for (int j = 0; j < TN; ++j) bq[j] = *(const v4i*)(fb + j * 16 * P + st * 16);
+#pragma unroll
+      for (int i = 0; i < TM; ++i) {
+        const v4i aq = *(const v4i*)(fa + i * 16 * P + st * 16);
+#pragma unroll
+        for (int j = 0; j < TN; ++j) sub[i][j] = mmai<true>(aq, bq[j], sub[i][j]);
+      }
+    }
+    if (p & 1) {
+#pragma unroll
+      for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+#pragma unroll
+          for (int e = 0; e < 8; ++e) acc[i][j][e] = fmaf((float)sub[i][j][e], sc[j], acc[i][j][e]);
+          sub[i][j] = (v8i)(0);
+        }
+    }
+    if (p + 1 < np) {
+      stage(S ^ 1, ra[S ^ 1], rb[S ^ 1]);
+      if (p + 3 < np) issue(p + 3, ra[S ^ 1], rb[S ^ 1]);
+    }
+    w4t2_barrier();
+  };
+
+  issue(0, ra[0], rb[0]);
+  if (np > 1) issue(1, ra[1], rb[1]);
+  stage(0, ra[0], rb[0]);
+  if (np > 2) issue(2, ra[0], rb[0]);
+  w4t2_barrier();
+  for (int p = 0; p < np; p += 2) {
+    step(p, 0);
+    step(p + 1, 1);
+  }
+
+#pragma unroll
+  for (int i = 0; i < TM; ++i)
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+      const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+      if (n >= N) continue;
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int m = m0 + (wm * TM + i) * 16 + accRow(lane, e);
+        if (m < M) {
+          const float v = 0.f + acc[i][j][e];
+          C[(size_t)m * N + n] = (__hip_bfloat16)(v * Ascale[m] * 0.0625f);
+        }
+      }
+    }
+}
+#undef R3DH_W4T2_P
+
 static void r3dh_gemm_w4a8_impl(long a, long ascale, long wq, long ws, long asum, long c,
                                int M, int K, int N, int WV, int SK, int MB, int NPW, int NT,
                                bool asym, long stream, bool chain = false) {
@@ -444,6 +598,23 @@ extern "C" int r3dh_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s) {
                                (int)g.M, (int)g.K, (int)g.N, c.wv, c.sk, c.mb, c.npw,
                                c.nt, true, (long)(uintptr_t)s, chain));
         return RAD_OK;
+    }
+    /* libr3d: the symmetric grid's prefill tile from 256 rows (above). */
+    if (g.M >= 256 && g.K % R3DH_GEMM_W4A8_GROUP == 0 && g.N % 16 == 0 &&
+        r3dh_addr(g.a) % 16 == 0 && g.K % 16 == 0) {
+      const dim3 grid((unsigned)((g.N + 127) / 128), (unsigned)((g.M + 127) / 128)), block(256);
+      hipStream_t st = (hipStream_t)s;
+      if (c.nt)
+        hipLaunchKernelGGL((r3dh_gemm_w4a8_t2_kernel<true>), grid, block, 0, st,
+                           (const signed char*)r3dh_addr(g.a), (const float*)r3dh_addr(g.ascale),
+                           (const unsigned*)r3dh_addr(g.b), (const unsigned*)r3dh_addr(g.bscale),
+                           (__hip_bfloat16*)r3dh_addr(g.y), (int)g.M, (int)g.K, (int)g.N);
+      else
+        hipLaunchKernelGGL((r3dh_gemm_w4a8_t2_kernel<false>), grid, block, 0, st,
+                           (const signed char*)r3dh_addr(g.a), (const float*)r3dh_addr(g.ascale),
+                           (const unsigned*)r3dh_addr(g.b), (const unsigned*)r3dh_addr(g.bscale),
+                           (__hip_bfloat16*)r3dh_addr(g.y), (int)g.M, (int)g.K, (int)g.N);
+      return hipGetLastError() == hipSuccess ? RAD_OK : R3DH_NO(RAD_E_DEVICE);
     }
     R3DH_TRY("gemm_w4a8_nt_m64",
         r3dh_gemm_w4a8_impl(r3dh_addr(g.a), r3dh_addr(g.ascale), r3dh_addr(g.b),
