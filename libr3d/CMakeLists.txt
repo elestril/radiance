@@ -191,6 +191,8 @@ set(R3D_UNITS
   "r3dh_norm_join_bf16|"
   # The dense w4a8 GEMM (Gemma 4 31B's trunk) and its weight layout (r3dh_w4_layout.cpp).
   "r3dh_gemm_w4a8_nt_m64|"
+  # Its decode form (M <= 4): the exact group sum on v_dot4_i32_iu8 from the stored fragment order.
+  "r3d_gemm_w4a8_gemv|"
   # A row in r3d_rows.cpp must name an entry point defined by one of these units: an undefined
   # symbol makes the whole plugin fail to load.
 )

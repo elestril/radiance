@@ -1787,6 +1787,8 @@ extern "C" int r3dh_rad_attn_window_h512_gqa16_bf16(const RadArgs* a, RadStream 
 extern "C" int r3dh_rad_attn_window_ahead_h256_gqa2_bf16(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
+/* its decode form (M <= 4), r3d_gemm_w4a8_gemv.hip, which hands every other launch to it */
+extern "C" int r3d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_layout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
                                   const RadTensor*, int, RadLayout*);
 extern "C" int r3dh_rad_relayout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -3613,7 +3615,7 @@ static const RadKernelInfo kKernels[] = {
   "accumulate per group",
   RAD_DOMAIN_DEVICE, R3D_PRIO_GEMM_FP8,
   ROW(cGemmW4A8M64), NOTUNE,
-  nullptr, nullptr, r3dh_rad_gemm_w4a8_m64, nullptr, r3dh_rad_layout_w4, r3dh_rad_relayout_w4,
+  nullptr, nullptr, r3d_rad_gemm_w4a8_m64, nullptr, r3dh_rad_layout_w4, r3dh_rad_relayout_w4,
   r3d_shape_gemm_nt_q_w4a8, r3dh_rad_unrelayout_w4 },
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
