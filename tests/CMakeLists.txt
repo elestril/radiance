@@ -80,6 +80,18 @@ if(TARGET libr3d)
     set_tests_properties(r3d_moe_iqr_catalogue PROPERTIES LABELS unit)
     add_test(NAME r3d_moe_iqr_gpu COMMAND r3d_moe_iqr_gpu $<TARGET_FILE:libr3d>)
     set_tests_properties(r3d_moe_iqr_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
+    # moe_gemm_q at w4a8 against a host reference, at decode and prefill heights: rad-kbench draws
+    # this op's activation as int8, so the E4M3 arms are compared here. The reference runs on
+    # threads.
+    add_executable(r3d_moe_w4a8_gpu r3d_moe_w4a8_gpu.cpp ../core/util/rad_util.cpp)
+    target_link_libraries(r3d_moe_w4a8_gpu PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS}
+                          Threads::Threads)
+    target_compile_options(r3d_moe_w4a8_gpu PRIVATE -ffp-contract=off)
+    add_dependencies(r3d_moe_w4a8_gpu libr3d)
+    add_test(NAME r3d_moe_w4a8_catalogue COMMAND r3d_moe_w4a8_gpu $<TARGET_FILE:libr3d> --catalogue-only)
+    set_tests_properties(r3d_moe_w4a8_catalogue PROPERTIES LABELS unit)
+    add_test(NAME r3d_moe_w4a8_gpu COMMAND r3d_moe_w4a8_gpu $<TARGET_FILE:libr3d>)
+    set_tests_properties(r3d_moe_w4a8_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
   endif()
 endif()
 # Their relayouts' vector loops, at every CPU level (libr4d/r4d_hsimd.h), built for these tests
