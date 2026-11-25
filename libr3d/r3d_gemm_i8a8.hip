@@ -27,7 +27,7 @@
  * grid is (N / 128, M / (16 * MT)). The B fragment (the weight column) is loaded once per 16-k
  * step and reused over the MT row tiles. MT is 1 for M <= 16 (decode: no second tile of clamped
  * duplicate rows) and 2 for 17 <= M < 128. A block reads its 128 weight rows once, so the weight
- * is read ceil(M / (16 * MT)) times in all; from M = 128 the tile kernel below serves the launch.
+ * is read ceil(M / (16 * MT)) times in all; from M = 128 the tile kernel below serves the launch, and from M = 256 its t2 form.
  *
  * ---- the B pointer --------------------------------------------------------------------------
  *
@@ -411,6 +411,170 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(4) void gemm_i8a8_tile_ker
         }
 }
 
+/* The same tile, M >= 128, with libhalo's tiled-GEMM lessons (r3d_vocab_bf16_wmma.hip's t2 arm):
+ * the block's eight waves as 2 (M) x 4 (N), each a 64 x 32 patch of 4 x 2 wave-matrix tiles, so a
+ * 16-K step reads six fragments (one ds_load_b128 each, 16-byte aligned rows) for eight WMMAs where
+ * the kernel above reads nine, four dwords at a time, for eight; K staged 64 deep into
+ * double-buffered LDS, the pass after next loaded into registers, one LDS-only barrier a pass;
+ * blocks in groups of eight M bands, so blocks in flight share their weight tiles in L2 (sixteen
+ * measured no better). The
+ * group's eight i32 sub-sums of a tile are exact in any order, and the group term is the kernel
+ * above's, (sub * a_scale[m, g]) * b_scale[n, g] rounded and added in ascending group order (a
+ * v_mul, a v_mul, a v_add: the build is -ffp-contract=off), so the two store the same bytes.
+ * Mistral Nemo's and Gemma 4 12B's 2048-row projections (RX 7900 XT): 58-72 TOP/s against 35-48
+ * for the tile above. */
+constexpr int kT2K = 64;                       /* K a staged pass: half a scale group */
+constexpr int kT2P = kT2K + 16;                /* bytes a staged row: 80, 16-byte aligned */
+
+__device__ __forceinline__ void t2_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+template <bool NT>
+__global__ __launch_bounds__(kBlockThreads) void gemm_i8a8_t2_kernel(
+    const int8_t* __restrict__ a, const float* __restrict__ sa, int sa_rb,
+    const uint8_t* __restrict__ B, int b_rb, const uint16_t* __restrict__ sb,
+    int sb_rb, uint16_t* __restrict__ Y,
+    int M, int N, int K, int a_ld, int y_ld)
+{
+    constexpr int TM = 4, TN = 2;
+    __shared__ __align__(16) uint8_t s_a[2][kTM * kT2P];
+    __shared__ __align__(16) uint8_t s_b[2][kTN * kT2P];
+    __shared__ float s_sa[2][kTM];               /* a group's a-scales, by group parity */
+
+    const int tid = (int)threadIdx.x, lane = tid & (kWave - 1);
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int wm = wave / 4, wn = wave % 4;
+
+    constexpr unsigned kGroupM = 8;
+    const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+    const unsigned first = lin / per * kGroupM, rr = lin % per;
+    const unsigned gm = min(gridDim.y - first, kGroupM);
+    const int m0 = (int)(first + rr % gm) * kTM, n0 = (int)(rr / gm) * kTN;
+
+    /* Staging: a thread two 16-byte pieces of one activation row and of one weight row. */
+    const int srow = tid >> 1, sseg = (tid & 1) * 32;
+    const int am = m0 + srow < M ? m0 + srow : M - 1;
+    const int bn = n0 + srow < N ? n0 + srow : N - 1;
+    const int8_t* asrc = a + (size_t)am * a_ld + sseg;
+    const uint8_t* bsrc = B + (size_t)bn * b_rb + sseg;
+    const int sdst = srow * kT2P + sseg;
+    /* Thread t < 128 stages row t's a-scale of each group. */
+    const float* sap = sa + (size_t)(m0 + tid < M ? m0 + tid : M - 1) * sa_rb;
+
+    int ncol[TN];
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+        const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+        ncol[j] = n < N ? n : N - 1;
+    }
+
+    const int np = K / kT2K;                      /* even: K % 128 */
+    r3d_u32x4 ra[2][2], rb[2][2];
+    float sa_n = 0.f, sbv[TN];
+    auto issue = [&](int q, r3d_u32x4 (&xa)[2], r3d_u32x4 (&xb)[2]) {
+        const int k0 = q * kT2K;
+        xa[0] = *(const r3d_u32x4*)(asrc + k0);
+        xa[1] = *(const r3d_u32x4*)(asrc + k0 + 16);
+        xb[0] = ldw<NT>(bsrc + k0);
+        xb[1] = ldw<NT>(bsrc + k0 + 16);
+        if ((q & 1) == 0 && tid < kTM) sa_n = sap[q / 2];
+    };
+    auto stage = [&](int q, int buf, const r3d_u32x4 (&xa)[2], const r3d_u32x4 (&xb)[2]) {
+        *(r3d_u32x4*)(s_a[buf] + sdst) = xa[0];
+        *(r3d_u32x4*)(s_a[buf] + sdst + 16) = xa[1];
+        *(r3d_u32x4*)(s_b[buf] + sdst) = xb[0];
+        *(r3d_u32x4*)(s_b[buf] + sdst + 16) = xb[1];
+        if ((q & 1) == 0 && tid < kTM) s_sa[(q / 2) & 1][tid] = sa_n;
+    };
+
+    v8float acc[TM][TN];
+    v8int sub[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            acc[i][j] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+            sub[i][j] = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        }
+
+    auto step = [&](int p, const int S) {
+        /* The group's weight scales, read at its second pass (the one its term closes on). */
+        if (p & 1) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j)
+                sbv[j] = bf16_to_f32((uint16_t)ldg_u16(sb + (size_t)ncol[j] * sb_rb + p / 2));
+        }
+        const uint8_t* fa = s_a[S] + (wm * TM * 16 + (lane & 15)) * kT2P;
+        const uint8_t* fw = s_b[S] + (wn * TN * 16 + (lane & 15)) * kT2P;
+#pragma unroll
+        for (int st = 0; st < kT2K / 16; ++st) {
+            r3d_u32x4 bq[TN];
+#pragma unroll
+            for (int j = 0; j < TN; ++j) bq[j] = *(const r3d_u32x4*)(fw + j * 16 * kT2P + st * 16);
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+                const r3d_u32x4 aq = *(const r3d_u32x4*)(fa + i * 16 * kT2P + st * 16);
+#pragma unroll
+                for (int j = 0; j < TN; ++j)
+                    sub[i][j] = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w },
+                                        v4int{ (int)bq[j].x, (int)bq[j].y, (int)bq[j].z, (int)bq[j].w },
+                                        sub[i][j]);
+            }
+        }
+        if (p & 1) {
+            /* The group term: (sub * a_scale[m, g]) * b_scale[n, g], rounded, then added. */
+            const float* sp = s_sa[(p / 2) & 1] + wm * TM * 16 + (lane >> 4);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int g2 = 0; g2 < 8; ++g2) {
+                    const float sav = sp[i * 16 + g2 * 2];
+#pragma unroll
+                    for (int j = 0; j < TN; ++j) {
+                        const float t = (float)sub[i][j][g2] * sav;
+                        acc[i][j][g2] = acc[i][j][g2] + t * sbv[j];
+                    }
+                }
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) sub[i][j] = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        }
+        if (p + 1 < np) {
+            stage(p + 1, S ^ 1, ra[S ^ 1], rb[S ^ 1]);
+            if (p + 3 < np) issue(p + 3, ra[S ^ 1], rb[S ^ 1]);
+        }
+        t2_barrier();
+    };
+
+    issue(0, ra[0], rb[0]);
+    if (np > 1) issue(1, ra[1], rb[1]);
+    stage(0, 0, ra[0], rb[0]);
+    if (np > 2) issue(2, ra[0], rb[0]);
+    t2_barrier();
+    for (int p = 0; p < np; p += 2) {
+        step(p, 0);
+        step(p + 1, 1);
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+            if (n >= N) continue;
+#pragma unroll
+            for (int g2 = 0; g2 < 8; ++g2) {
+                const int m = m0 + (wm * TM + i) * 16 + g2 * 2 + (lane >> 4);
+                if (m < M) Y[(size_t)m * y_ld + n] = f32_to_bf16(acc[i][j][g2]);
+            }
+        }
+}
+
 }  // namespace
 
 /* ==================================================================================================
@@ -474,6 +638,18 @@ extern "C" int r3d_rad_gemm_nt_q_i8a8(const RadArgs* a, RadStream s)
     const dim3 block(kBlockThreads);
     if (M >= kTM) {
         const dim3 tgrid((unsigned)((N + kTN - 1) / kTN), (unsigned)((M + kTM - 1) / kTM));
+        /* From 256 rows the t2 tile (at 128..255 its second row of blocks is mostly clamped
+         * rows, and 80 blocks of 2 x 4 waves leave the card half empty: 351 against 223 us). */
+        if (M >= 2 * kTM && ap % 16 == 0 && r3d_aligned(r3d_p(A), 16)) {
+#define R3D_I8A8T2(NTV)                                                                           \
+    R3D_KLAUNCH((gemm_i8a8_t2_kernel<NTV>), tgrid, block, (hipStream_t)s,                         \
+                (const int8_t*)r3d_p(A), (const float*)r3d_p(AS), (int)asp,                       \
+                (const uint8_t*)r3d_p(B), (int)bp, (const uint16_t*)r3d_p(BS), (int)bsp,          \
+                (uint16_t*)r3d_wp(Y), (int)M, (int)N, (int)K, (int)ap, (int)yp)
+            if (c.nt) R3D_I8A8T2(true); else R3D_I8A8T2(false);
+#undef R3D_I8A8T2
+            return hipGetLastError() == hipSuccess ? RAD_OK : R3D_NO(RAD_E_DEVICE);
+        }
 #define R3D_I8A8T(NTV)                                                                            \
     R3D_KLAUNCH((gemm_i8a8_tile_kernel<NTV>), tgrid, block, (hipStream_t)s,                       \
                 (const int8_t*)r3d_p(A), (const float*)r3d_p(AS), (int)asp,                       \
