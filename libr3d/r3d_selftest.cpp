@@ -3057,6 +3057,99 @@ static void check_moe_numerics() {
             }
         }
 
+        /* ---- moe_gemm_q at w4a8: int4 experts (two's-complement nibbles, the even k in a byte's
+         * low half) with a bf16 scale per (row, group of K), at weight scale groups 128 and 32,
+         * against an int8 and an E4M3 activation with an f32 scale per (row, 128 of K). A group's
+         * term is (sum * a_scale[row, block]) * w_scale[n, group], the groups added in ascending
+         * order. At int8 the group sum is exact in i32 and the device's output is compared bit for
+         * bit with that order run in f32 on the host. At E4M3 the device sums a group's products in
+         * f32 in its own order, so it is held to the relative L2 error above. libref leaves a row
+         * no expert owns as the caller set it, so y is cleared before the launch. */
+        if (auto w4_launch = (Launch)dlsym(g_h, "r3d_rad_moe_gemm_w4a8")) {
+            for (int wq = 0; wq < 4; ++wq) {
+                const int wg = wq < 2 ? 128 : 32, e4a = wq & 1;
+                const long long K = 256, G = K / wg;
+                Dev dv;
+                std::vector<uint8_t> ha(AR * K);
+                std::vector<float> has(AR * (K / 128));
+                /* An int8 code is -127..127, as the quantisers write it. */
+                for (auto& x : ha) { x = e4a ? e4() : rnd8(); if (!e4a && x == 0x80) x = 0x81; }
+                for (auto& x : has) x = 0.25f + std::fabs(rndf());
+                std::vector<std::vector<uint8_t>> wc(NE, std::vector<uint8_t>(N * K / 2)),
+                    ws(NE, std::vector<uint8_t>(N * G * 2));
+                for (long long e = 0; e < NE; ++e) {
+                    for (auto& x : wc[e]) x = rnd8();
+                    for (long long q = 0; q < N * G; ++q) {
+                        const uint16_t b = f32_to_bf16(0.25f + std::fabs(rndf()));
+                        std::memcpy(&ws[e][q * 2], &b, 2);
+                    }
+                }
+                auto wcode = [&](int e, long long n, long long k) -> int {
+                    const uint8_t b = wc[e][(n * K + k) / 2];
+                    const int nib = (k & 1) ? (b >> 4) : (b & 0xf);
+                    return nib >= 8 ? nib - 16 : nib;
+                };
+                std::vector<double> ref(T * N, 0.0);
+                std::vector<uint16_t> want(T * N, 0);
+                for (long long i = 0; i < T; ++i) {
+                    const int e = expert_of(r, i, NE);
+                    if (e < 0) continue;
+                    const long long tk = tok_of(i);
+                    for (long long n = 0; n < N; ++n) {
+                        double acc = 0;
+                        float accf = 0.0f;
+                        for (long long g = 0; g < G; ++g) {
+                            uint16_t sb; std::memcpy(&sb, &ws[e][(n * G + g) * 2], 2);
+                            const float sa = has[tk * (K / 128) + g * wg / 128], sw = bf16_to_f32(sb);
+                            double sum = 0;
+                            for (long long k = g * wg; k < (g + 1) * wg; ++k)
+                                sum += (e4a ? (double)e4m3_to_f32(ha[tk * K + k])
+                                            : (double)(int8_t)ha[tk * K + k]) * wcode(e, n, k);
+                            acc += sum * sa * sw;
+                            const float term = (float)sum * sa;
+                            accf += term * sw;
+                        }
+                        ref[i * N + n] = acc;
+                        want[i * N + n] = f32_to_bf16(accf);
+                    }
+                }
+                std::vector<std::vector<uint8_t>> wc0, wc1, ws0, ws1;
+                for (long long e = 0; e < NE; ++e) {
+                    (e % 2 ? wc1 : wc0).push_back(wc[e]);
+                    (e % 2 ? ws1 : ws0).push_back(ws[e]);
+                }
+                RadTensor t[9] = { dense(dv.put(ha.data(), ha.size()),
+                                         e4a ? (uint32_t)RAD_F8E4M3 : (uint32_t)RAD_I8, AR, K),
+                                   dense(dv.put(has.data(), has.size() * 4), RAD_F32, AR, K / 128),
+                                   table(dv, wc0, RAD_I4, N, K), table(dv, ws0, RAD_BF16, N, G),
+                                   vec(dv.put(r.sorted.data(), T * 4), RAD_I32, T),
+                                   vec(dv.put(r.off.data(), (NE + 1) * 4), RAD_I32, NE + 1),
+                                   table(dv, wc1, RAD_I4, N, K), table(dv, ws1, RAD_BF16, N, G),
+                                   dense(dv.put(nullptr, T * N * 2), RAD_BF16, T, N) };
+                const RadParam p[] = { pi("M", T), pi("N", N), pi("K", K), pi("n_expert", NE),
+                                       pi("top_k", TK), pi("group", wg), ps("a_order", order),
+                                       ps("dtype", "w4a8") };
+                RadArgs a{ t, 9, p, (int)(sizeof(p) / sizeof(p[0])), nullptr, 0, nullptr, 0, 1 };
+                const int rc = w4_launch(&a, nullptr);
+                char what[96];
+                std::snprintf(what, sizeof what, "moe_gemm_q w4a8, %s a, group %d, a_order %s",
+                              e4a ? "E4M3" : "int8", wg, order);
+                if (hipDeviceSynchronize() != hipSuccess) { fail("%s: the kernel faulted", what); continue; }
+                if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+                std::vector<uint16_t> y(T * N);
+                if (hipMemcpy(y.data(), t[8].data, y.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+                    fail("%s: copying y back failed", what); continue; }
+                compare(what, ref, y, 1e-2);
+                if (e4a) continue;
+                long long bad = 0;
+                for (size_t i = 0; i < y.size(); ++i) bad += y[i] != want[i];
+                if (bad) fail("%s: %lld of %lld outputs differ from the reference", what, bad, T * N);
+                else ok("%s: %lld outputs bit-identical to the reference", what, T * N);
+            }
+        } else {
+            fail("r3d_rad_moe_gemm_w4a8 is missing");
+        }
+
     }
 #endif
 }
