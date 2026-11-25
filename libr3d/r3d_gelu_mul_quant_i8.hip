@@ -87,6 +87,59 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void gelu_mul_quant_i8_
     }
 }
 
+/* The wide form: 1024 threads and eight columns a thread a turn on 16-byte loads, so a decode
+ * row (one workgroup) is a few round trips instead of n / 256 dependent ones. The product of each
+ * column is the expression above; the absmax is a max, so the partition does not change it, and
+ * the codes are the same: byte-identical. Needs 16-byte aligned rows (the launcher checks). */
+constexpr uint32_t kWide = 1024;
+__global__ __launch_bounds__(kWide) void gelu_mul_quant_i8_wide_kernel(
+    const uint16_t* __restrict__ gu, uint8_t* __restrict__ q, float* __restrict__ s,
+    uint16_t* __restrict__ yo, uint32_t n, uint32_t gu_ld, uint32_t y_ld) {
+    extern __shared__ uint16_t ybuf[];      // n bf16 of the product
+    __shared__ float lm[kWide / kWave];
+    const uint32_t row = blockIdx.x;
+    const uint16_t* gr = gu + (size_t)row * gu_ld;
+    uint8_t* qr = q + (size_t)row * n;
+    uint16_t* yop = yo ? yo + (size_t)row * y_ld : nullptr;
+
+    constexpr float k0 = 0.7978845608028654f, k1 = 0.044715f;
+    float m = 0.0f;
+    for (uint32_t c = threadIdx.x; c < n / 8; c += kWide) {
+        const uint4 g8 = *(const uint4*)(gr + 8 * c), u8 = *(const uint4*)(gr + n + 8 * c);
+        const uint32_t gw[4] = { g8.x, g8.y, g8.z, g8.w }, uw[4] = { u8.x, u8.y, u8.z, u8.w };
+        uint32_t o[4];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const float g = bf16_to_f32((uint16_t)(gw[e / 2] >> (16 * (e & 1))));
+            const float up = bf16_to_f32((uint16_t)(uw[e / 2] >> (16 * (e & 1))));
+            const float gelu = 0.5f * g * (1.0f + tanhf(k0 * (g + k1 * g * g * g)));
+            const uint16_t y = f32_to_bf16(gelu * up);
+            m = fmaxf(m, fabsf(bf16_to_f32(y)));
+            if (e & 1) o[e / 2] |= (uint32_t)y << 16; else o[e / 2] = y;
+        }
+        const uint4 ov = make_uint4(o[0], o[1], o[2], o[3]);
+        *(uint4*)(ybuf + 8 * c) = ov;
+        if (yop) *(uint4*)(yop + 8 * c) = ov;
+    }
+    const uint32_t lane = threadIdx.x & (kWave - 1), wave = threadIdx.x / kWave;
+    m = wave_max(m);
+    if (lane == 0) lm[wave] = m;
+    __syncthreads();
+    m = lm[0];
+#pragma unroll
+    for (uint32_t w = 1; w < kWide / kWave; ++w) m = fmaxf(m, lm[w]);
+    const float scale = fmaxf(m, kI8Floor) / kTopI8;
+    const float inv = 1.0f / scale;
+    if (threadIdx.x == 0) s[row] = scale;
+
+    for (uint32_t c = threadIdx.x * 4; c < n; c += kWide * 4) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = bf16_to_f32(ybuf[c + (uint32_t)j]);
+        *(uint32_t*)(qr + i8_step_pos(c)) = i8_codes4(v, inv);
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -120,6 +173,14 @@ int r3d_rad_gelu_mul_quant_i8(const RadArgs* a, RadStream s)
     if (lds > 60 * 1024) return R3D_NO(RAD_E_SHAPE);
 
     dim3 grid((unsigned)M), blk(kThreads);
+    const bool wide = !((uintptr_t)r3d_p(gu) & 15) && !(gu_ld & 7) &&
+                      (!y || (!((uintptr_t)r3d_wp(y) & 15) && !(y_ld & 7)));
+    if (wide) {
+        R3D_KLAUNCH_S(gelu_mul_quant_i8_wide_kernel, grid, dim3(kWide), (size_t)lds, (hipStream_t)s,
+                      (const uint16_t*)r3d_p(gu), (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc),
+                      (uint16_t*)(y ? r3d_wp(y) : nullptr), (uint32_t)n, gu_ld, y_ld);
+        return (int)hipGetLastError();
+    }
     R3D_KLAUNCH_S(gelu_mul_quant_i8_kernel, grid, blk, (size_t)lds, (hipStream_t)s,
                   (const uint16_t*)r3d_p(gu), (uint8_t*)r3d_wp(q), (float*)r3d_wp(sc),
                   (uint16_t*)(y ? r3d_wp(y) : nullptr), (uint32_t)n, gu_ld, y_ld);

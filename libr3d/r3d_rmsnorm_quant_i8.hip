@@ -124,6 +124,90 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void rmsnorm_quant_i8_k
         ybuf, l2, lm);
 }
 
+/* The register form, for decode heights (n <= 256 * NPT): the same passes in the same order over
+ * the same partition (thread t holds columns t, t + 256, ...), with every operand a thread reads
+ * loaded into registers up front instead of re-read in each pass, so a row costs one round trip
+ * to memory instead of one a pass. Byte-identical to the re-read form. */
+template <int NPT, bool WF32, bool RES, bool POST, bool SCL>
+__global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void rmsnorm_quant_i8_reg_kernel(
+    const uint16_t* __restrict__ x, uint16_t* __restrict__ res, const void* __restrict__ w,
+    const void* __restrict__ wp, const void* __restrict__ sc, uint32_t sc_f32,
+    signed char* __restrict__ q, float* __restrict__ S, uint16_t* __restrict__ yo, uint32_t n,
+    float eps, float wadd, uint32_t x_ld, uint32_t r_ld, uint32_t y_ld) {
+    extern __shared__ uint16_t ybuf[];
+    __shared__ float l1[kWaves], l2[kWaves], lm[kWaves];
+    const uint32_t row = blockIdx.x, t0 = threadIdx.x;
+    const uint16_t* __restrict__ xr = x + (size_t)row * x_ld;
+    uint16_t* __restrict__ rr = RES ? res + (size_t)row * r_ld : nullptr;
+    uint16_t* __restrict__ yr = yo ? yo + (size_t)row * y_ld : nullptr;
+
+    uint16_t xv[NPT], rv[NPT];
+    float gv[NPT], pv[NPT];
+#pragma unroll
+    for (int j = 0; j < NPT; ++j) {
+        const uint32_t i = t0 + (uint32_t)j * kThreads;
+        const bool in = i < n;
+        xv[j] = in ? (uint16_t)ldg_u16(xr + i) : (uint16_t)0;
+        if (RES) rv[j] = in ? (uint16_t)ldg_u16(rr + i) : (uint16_t)0;
+        gv[j] = in ? gain<WF32>(w, i) : 0.0f;
+        if (POST) pv[j] = in ? gain<WF32>(wp, i) : 0.0f;
+    }
+    float s1 = 0.0f;
+    if (POST) {
+        float ss = 0.0f;
+#pragma unroll
+        for (int j = 0; j < NPT; ++j)
+            if (t0 + (uint32_t)j * kThreads < n) { const float v = bf2f(xv[j]); ss += v * v; }
+        ss = block_sum<kThreads>(ss, l1);
+        s1 = rsqrtf(ss / (float)n + eps);
+    }
+    const float sv = SCL ? scalar_of(sc, sc_f32) : 1.0f;
+    float ss2 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NPT; ++j) {
+        const uint32_t i = t0 + (uint32_t)j * kThreads;
+        if (i >= n) continue;
+        uint16_t v = xv[j];
+        if (RES) {
+            if (POST) v = f32_to_bf16(bf2f(v) * s1 * (pv[j] + wadd));
+            v = f32_to_bf16(bf2f(rv[j]) + bf2f(v));
+            if (SCL) v = f32_to_bf16(bf2f(v) * sv);
+            rr[i] = v;
+        }
+        xv[j] = v;
+        const float f = bf2f(v);
+        ss2 += f * f;
+    }
+    ss2 = block_sum<kThreads>(ss2, l2);
+    const float s2 = rsqrtf(ss2 / (float)n + eps);
+    float m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < NPT; ++j) {
+        const uint32_t i = t0 + (uint32_t)j * kThreads;
+        if (i >= n) continue;
+        const uint16_t y = f32_to_bf16(bf2f(xv[j]) * s2 * (gv[j] + wadd));
+        ybuf[i] = y;
+        if (yr) yr[i] = y;
+        m = fmaxf(m, fabsf(bf2f(y)));
+    }
+    m = wave_max(m);
+    if ((t0 & 31) == 0) lm[t0 >> 5] = m;
+    R3D_BARRIER();   // also publishes ybuf to every thread
+    m = lm[0];
+#pragma unroll
+    for (uint32_t i = 1; i < kWaves; ++i) m = fmaxf(m, lm[i]);
+    const float scale = fmaxf(m, kFloor) / kTopI8;
+    const float inv = 1.0f / scale;
+    if (t0 == 0) S[row] = scale;
+    signed char* __restrict__ qr = q + (size_t)row * n;
+    for (uint32_t i = t0; i < n; i += kThreads) {
+        const uint32_t s = i >> 4, j = i & 15;
+        const uint32_t src = (s << 4) + 8 * ((j & 7) >> 2) + 4 * (j >> 3) + (j & 3);
+        const int t = (int)lrintf(bf2f(ybuf[src]) * inv);
+        qr[i] = (signed char)(t < -128 ? -128 : (t > 127 ? 127 : t));
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -184,10 +268,19 @@ int r3d_rad_rmsnorm_quant_i8(const RadArgs* a, RadStream s)
     float* sp = (float*)r3d_wp(sc);
     uint16_t* yp = y ? (uint16_t*)r3d_wp(y) : nullptr;
 
+    /* Decode heights take the register form (one round trip a row), n <= 256 * 24. */
+    const bool reg = M <= 16 && n <= (long long)kThreads * 24;
 #define RQ8(WF_, RS_, PO_, SC_)                                                                  \
-    R3D_KLAUNCH_S(R3D_KNAME(rmsnorm_quant_i8_kernel<WF_, RS_, PO_, SC_>), grid, blk, lds,        \
-                  (hipStream_t)s, xp, rwp, wv, wpp, svp, scf, qp, sp, yp, (uint32_t)n, eps, wadd,\
-                  x_ld, r_ld, y_ld)
+    do {                                                                                         \
+        if (reg)                                                                                 \
+            R3D_KLAUNCH_S(R3D_KNAME(rmsnorm_quant_i8_reg_kernel<24, WF_, RS_, PO_, SC_>), grid,   \
+                          blk, lds, (hipStream_t)s, xp, rwp, wv, wpp, svp, scf, qp, sp, yp,      \
+                          (uint32_t)n, eps, wadd, x_ld, r_ld, y_ld);                             \
+        else                                                                                     \
+            R3D_KLAUNCH_S(R3D_KNAME(rmsnorm_quant_i8_kernel<WF_, RS_, PO_, SC_>), grid, blk, lds, \
+                          (hipStream_t)s, xp, rwp, wv, wpp, svp, scf, qp, sp, yp, (uint32_t)n,   \
+                          eps, wadd, x_ld, r_ld, y_ld);                                          \
+    } while (0)
     if (WF) {
         if (!RS) RQ8(true, false, false, false);
         else if (!PO && !SC) RQ8(true, true, false, false);
