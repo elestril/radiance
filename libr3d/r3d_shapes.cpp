@@ -256,7 +256,10 @@ int r3d_shape_rope(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
 }
 
 /* K and V into a paged cache. Two blocks of slack over the tokens, so the slot mapping is not a
- * dense prefix. Only the cache takes `kv_dtype`; k and v are always bf16. */
+ * dense prefix. Only the cache takes `kv_dtype`; k and v are always bf16. A slot of the int8 cache
+ * is the K and V codes and then their two f16 scales (abi/rad_builder.h, rad_kv_row_elems); the
+ * store writes every byte of a slot it takes, so the cache's own draw is only what the other slots
+ * hold. */
 int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out) {
     const int64_t M   = gi(p, n_p, "M", 0);
     const int64_t hd  = gi(p, n_p, "head_dim", 0);
@@ -270,7 +273,7 @@ int r3d_shape_kv_store(const RadParam* p, int n_p, int operand, RadOpdDesc* out)
         opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* k */
         opd((uint32_t)RAD_BF16, M, kvh, hd),                        /* v */
         opd_idx(M, nb * bs, -1, RAD_OPD_F_IDX_UNIQUE),              /* slot_mapping */
-        opd(KV, nb, kvh, bs, 2 * hd)                                /* kv_cache, INOUT */
+        opd(KV, nb, kvh, bs, 2 * hd + (KV == (uint32_t)RAD_I8 ? 4 : 0))   /* kv_cache, INOUT */
     };
     R3D_PICK(list);
 }

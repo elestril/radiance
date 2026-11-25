@@ -1,7 +1,7 @@
-/* mul_weight, logit_softcap, rmsnorm_p and gelu_mul: libhalo's kernels and shims
+/* mul_weight, logit_softcap, rmsnorm_p, gelu_mul and kv_store_i8: libhalo's kernels and shims
  * (libhalo/halo_model_bf16.hip), taken out of that unit with the halo_ -> r3dh_ rename. The rest
  * of halo_model_bf16.hip duplicates ops libr3d already serves (r3d_model_bf16.hip), so only these
- * four came over.
+ * five came over.
  * The chained forms are left out: libr3d builds no chained form (README, "No collective rows and
  * no chained forms").
  *
@@ -16,6 +16,8 @@
  *                  wave order, rmsnorm's tree.
  *   gelu_mul       y = gelu_tanh(gate_up[i]) * gate_up[n + i], the gate the first half
  *                  (ref_gelu_mul), the dense feed-forward's product.
+ *   kv_store_i8    k and v into the paged int8 cache (`kv-cache-dtype: i8`): a head's K and its V
+ *                  as int8 codes with one f16 scale each (see the kernel's comment).
  */
 #include "r3dh_args.h"
 #include "r3dh_common.h"
@@ -199,5 +201,90 @@ extern "C" int r3dh_rad_gelu_mul(const RadArgs* a, RadStream s) {
     hipLaunchKernelGGL(gelu_mul_kernel, dim3((uint32_t)M, by < 1 ? 1 : by), dim3(kThreads), 0,
                        (hipStream_t)s, (const uint16_t*)gu->data, (uint16_t*)y->data, (uint32_t)n,
                        (uint32_t)gu_ld, (uint32_t)y_ld);
+    return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
+}
+
+/* ------------------------------------------------------------------ kv_store into the int8 cache
+ * libhalo's kv_store_i8 (halo_model_bf16.hip), for `kv-cache-dtype: i8`: a head's K and its V each
+ * as int8 codes against one f16 scale, the head's absmax / 127, written after the codes. One
+ * workgroup a (token, head) and one dim a lane; the scale is rounded to f16 first and the codes are
+ * taken against the rounded value, clamped so 127 times it stays an f16; an all-zero head stores
+ * scale 0 and codes 0. The chained form is left out. */
+namespace {
+struct KvI8 { uint8_t k, v; uint16_t ks, vs; };
+__device__ __forceinline__ KvI8 kv_i8_quant(const uint16_t* __restrict__ k,
+                                            const uint16_t* __restrict__ v, uint32_t head_dim,
+                                            uint32_t k_ld, uint32_t v_ld, float (*s_m)[32]) {
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const bool in = d < head_dim;
+    const float kf = in ? bf16_to_f32(k[(size_t)t * k_ld + (size_t)h * head_dim + d]) : 0.0f;
+    const float vf = in ? bf16_to_f32(v[(size_t)t * v_ld + (size_t)h * head_dim + d]) : 0.0f;
+    float km = r3dh_wave_max(fabsf(kf)), vm = r3dh_wave_max(fabsf(vf));
+    if ((d & 31u) == 0u) { s_m[0][d >> 5] = km; s_m[1][d >> 5] = vm; }
+    __syncthreads();
+    km = 0.0f; vm = 0.0f;
+    for (uint32_t w = 0; w < blockDim.x / 32u; ++w) {
+        km = fmaxf(km, s_m[0][w]);
+        vm = fmaxf(vm, s_m[1][w]);
+    }
+    const __fp16 k16 = (__fp16)fminf(km / 127.0f, 515.0f);
+    const __fp16 v16 = (__fp16)fminf(vm / 127.0f, 515.0f);
+    const float ksc = (float)k16, vsc = (float)v16;
+    const float kr = ksc > 0.0f ? rintf(kf / ksc) : 0.0f;
+    const float vr = vsc > 0.0f ? rintf(vf / vsc) : 0.0f;
+    KvI8 q;
+    q.k  = (uint8_t)(int8_t)(int)fminf(fmaxf(kr, -127.0f), 127.0f);
+    q.v  = (uint8_t)(int8_t)(int)fminf(fmaxf(vr, -127.0f), 127.0f);
+    q.ks = __builtin_bit_cast(uint16_t, k16);
+    q.vs = __builtin_bit_cast(uint16_t, v16);
+    return q;
+}
+__global__ __launch_bounds__(1024) void kv_store_i8_kernel(
+    const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+    const int32_t* __restrict__ slot, uint8_t* __restrict__ kv, uint32_t head_dim,
+    uint32_t kv_heads, uint32_t block_size, uint32_t n_blocks, uint32_t k_ld, uint32_t v_ld) {
+    __shared__ float s_m[2][32];
+    const uint32_t t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const KvI8 q = kv_i8_quant(k, v, head_dim, k_ld, v_ld, s_m);
+    const int32_t s = slot[t];
+    if (d >= head_dim || s < 0 || (uint32_t)s / block_size >= n_blocks) return;
+    const uint32_t blk = (uint32_t)s / block_size, off = (uint32_t)s % block_size;
+    const size_t row = 2 * (size_t)head_dim + 4;
+    uint8_t* c = kv + (((size_t)blk * kv_heads + h) * block_size + off) * row;
+    c[d]            = q.k;
+    c[head_dim + d] = q.v;
+    if (d == 0u) {
+        *(uint16_t*)(c + 2 * head_dim)     = q.ks;
+        *(uint16_t*)(c + 2 * head_dim + 2) = q.vs;
+    }
+}
+}  // namespace
+
+/* Operands k, v, slot_mapping, kv_cache (libref's kv_store); the cache exactly
+ * [n_blocks, kv_heads, block_size, 2 * head_dim + 4] int8. */
+extern "C" int r3dh_rad_kv_store_i8(const RadArgs* a, RadStream s) {
+    const RadTensor *k = r3dh_opt(a, 0), *v = r3dh_opt(a, 1), *sm = r3dh_opt(a, 2),
+                    *kv = r3dh_opt(a, 3);
+    if (!k || !v || !sm || !kv) return R3DH_NO(RAD_E_INVAL);
+    if (k->dtype != RAD_BF16 || v->dtype != RAD_BF16 || sm->dtype != RAD_I32 ||
+        kv->dtype != RAD_I8) return R3DH_NO(RAD_E_DTYPE);
+    if (!r3dh_contig(sm) || !r3dh_contig(kv)) return R3DH_NO(RAD_E_STRIDE);
+    const long long hd = r3dh_geti_or(a, "head_dim", r3dh_dim(k, (int)k->rank - 1));
+    const long long bs = r3dh_geti_or(a, "block_size", 0);
+    const long long kvh = r3dh_geti_or(a, "n_head_kv", kv->rank == 4 ? kv->shape[1] : 0);
+    if (hd <= 0 || bs <= 0 || kvh <= 0 || hd % 4 || hd > 1024) return R3DH_NO(RAD_E_SHAPE);
+    if (kv->rank != 4 || kv->shape[1] != kvh || kv->shape[2] != bs || kv->shape[3] != 2 * hd + 4)
+        return R3DH_NO(RAD_E_SHAPE);
+    long long M = 0, Mv = 0;
+    const long long k_ld = r3dh_rows_pitch(k, kvh * hd, &M);
+    const long long v_ld = r3dh_rows_pitch(v, kvh * hd, &Mv);
+    if (k_ld < 0 || v_ld < 0) return R3DH_NO(RAD_E_STRIDE);
+    const long long T = r3dh_numel(sm);
+    if (T <= 0 || M < T || Mv < T || T > 0x7fffffff) return R3DH_NO(RAD_E_SHAPE);
+    hipLaunchKernelGGL(kv_store_i8_kernel, dim3((uint32_t)T, (uint32_t)kvh),
+                       dim3((uint32_t)((hd + 31) / 32 * 32)), 0, (hipStream_t)s,
+                       (const uint16_t*)k->data, (const uint16_t*)v->data,
+                       (const int32_t*)sm->data, (uint8_t*)kv->data, (uint32_t)hd, (uint32_t)kvh,
+                       (uint32_t)bs, (uint32_t)kv->shape[0], (uint32_t)k_ld, (uint32_t)v_ld);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }

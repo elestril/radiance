@@ -1377,8 +1377,8 @@ extern "C" {
 /* The geometries libr3d serves, at the bf16 cache: Gemma 4 26B-A4B's sliding layers (head_dim 256,
  * 16 query heads over 8 KV heads) and full layers (head_dim 512, 16 over 2) at one rank, and the
  * 12B's full layers (head_dim 512, 16 over 1). libhalo
- * instantiates more (the E4M3 and int8 caches, the other geometries, the ahead form at the other
- * caches and geometries, the tree, anchor and sink forms);
+ * instantiates more (the E4M3 cache, the other geometries, the ahead form at the other caches and
+ * geometries, the tree, anchor and sink forms);
  * each is one line here and a row in r3d_rows.cpp, left out until a model on gfx11 needs it,
  * because every instantiation is a full compile of both kernels. */
 #define R3DH_WIN_DEF(HD, G)                                                                        \
@@ -1389,6 +1389,15 @@ R3DH_WIN_DEF(256, 2) R3DH_WIN_DEF(512, 8)
 /* Gemma 4 12B's full layers at one rank: 16 query heads over one KV head. */
 R3DH_WIN_DEF(512, 16)
 #undef R3DH_WIN_DEF
+
+/* The int8 cache (`kv-cache-dtype: i8`, kv_store_i8's rows: K and V int8 with an f16 scale each
+ * per token and head), at the same geometries. */
+#define R3DH_WIN_DEF_I8(HD, G)                                                                     \
+    int r3dh_rad_attn_window_h##HD##_gqa##G##_i8(const RadArgs* a, RadStream s) {                  \
+        return r3dh_win::launch_attn<HD, G, 2>(a, s);                                              \
+    }
+R3DH_WIN_DEF_I8(256, 2) R3DH_WIN_DEF_I8(512, 8) R3DH_WIN_DEF_I8(512, 16)
+#undef R3DH_WIN_DEF_I8
 
 /* attn_paged_ahead and attn_paged_qrow_ahead: a non-causal window that bounds the keys behind only
  * (FWD), a Gemma 4 sliding layer's mask over a picture's rows (docs/OPS.md). */

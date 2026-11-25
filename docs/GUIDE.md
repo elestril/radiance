@@ -1093,7 +1093,10 @@ bf16's `4 * head_dim`. It halves what a token of context costs, which at a produ
 most of the pool. It is a real quantisation that changes the output slightly, so it is only ever set
 explicitly. Every paged attention serves both caches, a drafter's (DSpark, DFlash2, Gemma 4's)
 included, and a streamed group (`kv-resident`) streams either. The delta-net state and the QSA
-indexer's key tail are recurrent state and keep their own widths.
+indexer's key tail are recurrent state and keep their own widths. On a gfx11 card (libr3d) the int8
+cache is served for Gemma 4's text attention only: the windowed kernels at head_dim 256 with 2
+queries per KV head and at head_dim 512 with 8 or 16. The open-ended window over a picture's rows
+(`attn_paged_ahead`) and libr3d's other paged attention read a bf16 or E4M3 cache.
 
 On two R9700s over four agent traces of about 245 000 tokens each, Qwen3.8-27B against the same
 weights with a bf16 cache, scored on the 453 857 positions the model writes itself:

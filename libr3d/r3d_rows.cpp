@@ -1789,6 +1789,10 @@ extern "C" int r3dh_rad_router_gemm_topk_scatter(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
 /* its decode form (M <= 4), r3d_gemm_w4a8_gemv.hip, which hands every other launch to it */
 extern "C" int r3d_rad_gemm_w4a8_m64(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_kv_store_i8(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h256_gqa2_i8(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h512_gqa8_i8(const RadArgs* a, RadStream s);
+extern "C" int r3dh_rad_attn_window_h512_gqa16_i8(const RadArgs* a, RadStream s);
 extern "C" int r3dh_rad_layout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
                                   const RadTensor*, int, RadLayout*);
 extern "C" int r3dh_rad_relayout_w4(const RadParam*, int, int, const RadEncoding*, const int*,
@@ -1843,6 +1847,16 @@ static const RadConstraint cRouterGemmTopkScatter[] = { C_GE("M", 1), C_LE("M", 
 static const RadConstraint cGemmW4A8M64[] = { C_IN("dtype", "w4a8"), C_GE("M", 1), C_LE("M", 8192),
                                               C_DIV("K", 128), C_DIV("N", 16),
                                               C_EQ("group", R3D_FP8_BLOCK) };
+/* The int8 cache: kv_store_i8, and the windowed kernels over it. */
+static const RadConstraint cKvStoreI8[] = { C_GE("block_size", 1), C_DIV("head_dim", 4),
+                                            C_LE("head_dim", 1024), C_IN("kv_dtype", "i8") };
+#define R3D_WIN_I8(NAME, HD, G)                                                                     \
+    static const RadConstraint NAME[] = { C_EQ("head_dim", HD), C_EQ("gqa", G),                     \
+                                          C_EQ("block_size", 16), C_GE("causal", 0),                \
+                                          C_GE("window", 0), C_IN("q_dtype", "bf16"),               \
+                                          C_IN("kv_dtype", "i8") };
+R3D_WIN_I8(cWinH256G2I8, 256, 2) R3D_WIN_I8(cWinH512G8I8, 512, 8) R3D_WIN_I8(cWinH512G16I8, 512, 16)
+#undef R3D_WIN_I8
 /* The open-ended window (attn_paged_ahead): non-causal, a window of at least one. */
 static const RadConstraint cWinAheadH256G2Bf16[] = { C_EQ("head_dim", 256), C_EQ("gqa", 2),
                                                      C_EQ("block_size", 16), C_EQ("causal", 0),
@@ -3619,6 +3633,63 @@ static const RadKernelInfo kKernels[] = {
   ROW(cGemmW4A8M64), NOTUNE,
   nullptr, nullptr, r3d_rad_gemm_w4a8_m64, nullptr, r3dh_rad_layout_w4, r3dh_rad_relayout_w4,
   r3d_shape_gemm_nt_q_w4a8, r3dh_rad_unrelayout_w4 },
+{ "kv_store_i8", "kv_store", "attn",
+  "scatter k and v into a paged int8 cache, one workgroup a token and head",
+  "cache exactly [n_blocks, kv_heads, block_size, 2*head_dim+4]; head_dim a multiple of 4, at most "
+  "1024; a negative or out-of-range slot stores nothing",
+  "bf16 k / v, int8 K and V with one f16 scale each per token and head (the head's absmax / 127), "
+  "i32 slot mapping",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cKvStoreI8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_kv_store_i8, nullptr, nullptr, nullptr, r3d_shape_kv_store },
+/* The windowed kernels over the int8 cache. Their `opd_shape` is null: a slot is int8 codes and
+ * then two f16 scales, one plane of two dtypes, and a draw of int8 codes in the scales' place
+ * spells infinities and NaNs. libref's description declines the cache for the same reason, so
+ * rad-kbench has no case for these rows; r3d_selftest builds their cache by hand, and
+ * tests/r3d_kv_i8_gpu.cpp checks their values against the bf16 rows. */
+{ "attn_window_h256_gqa2_i8kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query, int8 kv cache (an f16 scale of K and of V per token and head), bf16 out, f32 "
+  "partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH256G2I8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h256_gqa2_i8, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, nullptr },
+{ "attn_qrow_h256_gqa2_i8kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, any window, causal or not",
+  "head_dim 256, 2 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query (any row pitch), int8 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH256G2I8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h256_gqa2_i8, r3dh_rad_attn_window_h256_scratch,
+  nullptr, nullptr, nullptr },
+{ "attn_window_h512_gqa8_i8kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query, int8 kv cache (an f16 scale of K and of V per token and head), bf16 out, f32 "
+  "partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G8I8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa8_i8, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, nullptr },
+{ "attn_qrow_h512_gqa8_i8kv", "attn_paged_qrow", "attn",
+  "paged attention reading q at its own row pitch, any window, causal or not",
+  "head_dim 512, 8 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query (any row pitch), int8 kv cache, bf16 out, f32 partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G8I8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa8_i8, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, nullptr },
+{ "attn_window_h512_gqa16_i8kv", "attn_paged", "attn",
+  "paged attention, any window, causal or not; split-KV with a merge where tiles are few",
+  "head_dim 512, 16 queries per kv head, paged block 16, any q_len, varlen",
+  "bf16 query, int8 kv cache (an f16 scale of K and of V per token and head), bf16 out, f32 "
+  "partials",
+  RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
+  ROW(cWinH512G16I8), NOTUNE,
+  nullptr, nullptr, r3dh_rad_attn_window_h512_gqa16_i8, r3dh_rad_attn_window_h512_scratch,
+  nullptr, nullptr, nullptr },
 { "router_gemm_topk_scatter_bf16", "router_gemm_topk_scatter", "moe",
   "the router GEMM, its top-k and the stable counting sort in one launch -- the last workgroup "
   "of the GEMM ranks -- and optionally the shared expert's one-column gate beside it",

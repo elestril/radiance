@@ -402,6 +402,9 @@ static void check_shapes() {
                          PI("rotary_dim", 64), PS("ladder", "head") } },
         { "kv_store", { PI("M", 8), PI("head_dim", 128), PI("n_head_kv", 8), PI("block_size", 32),
                         PS("kv_dtype", "bf16") } },
+        /* The int8 cache: a slot is 2 * head_dim codes and then four bytes of scales. */
+        { "kv_store", { PI("M", 8), PI("head_dim", 512), PI("n_head_kv", 2), PI("block_size", 16),
+                        PS("kv_dtype", "i8") } },
         { "embed_lookup", { PI("M", 8), PI("n_embd", 4096), PI("n_vocab", 128256),
                             PS("dtype", "bf16") } },
         { "gather_rows", { PI("M", 8), PI("n", 4096), PS("dtype", "bf16") } },
@@ -929,6 +932,97 @@ static void make_params(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
         }
         c.p[c.n_p++] = out;
     }
+}
+
+/* ------------------------------------------------------------------ attention over the int8 cache
+ *
+ * A slot of the int8 cache is head_dim K codes, head_dim V codes and their two f16 scales
+ * (abi/rad_builder.h): one plane of two dtypes, which a RadOpdDesc cannot draw, because int8 codes
+ * drawn into the scales' place spell infinities and NaNs. libref's description declines the cache
+ * for that reason, so these rows' `opd_shape` is null and this builds their case by hand:
+ * attn_paged's operands at the row's own constraint values, two KV heads over a 40-key context in
+ * three blocks (the last partly filled, the block table not in order), every code drawn and every
+ * slot given its own two scales. The qrow rows take q at a pitch with NaN between the rows, as
+ * run_row lays it for the described ones. What the rows compute is checked against the bf16 rows
+ * in tests/r3d_kv_i8_gpu.cpp. */
+static bool is_attn_i8kv_row(const RadKernelInfo* k) {
+    if (!k->op || std::strncmp(k->op, "attn_paged", 10)) return false;
+    for (int ci = 0; ci < k->n_constraints; ++ci) {
+        const RadConstraint& x = k->constraints[ci];
+        if (x.key && x.sval && !std::strcmp(x.key, "kv_dtype") && !std::strcmp(x.sval, "i8"))
+            return true;
+    }
+    return false;
+}
+
+static int build_attn_i8kv(Case& c, const RadKernelInfo* k, const RadOpSchema* s) {
+    if (s->n_operands != 8) { fail("%s: the schema has %d operands, not 8", k->name,
+                                   s->n_operands); return 1; }
+    long long hd = 0, gqa = 0, bs = 0, q_len = 0;
+    for (int i = 0; i < c.n_p; ++i) {
+        if (c.p[i].kind != RAD_P_INT) continue;
+        if (!std::strcmp(c.p[i].key, "head_dim")) hd = c.p[i].ival;
+        if (!std::strcmp(c.p[i].key, "gqa")) gqa = c.p[i].ival;
+        if (!std::strcmp(c.p[i].key, "block_size")) bs = c.p[i].ival;
+        if (!std::strcmp(c.p[i].key, "q_len")) q_len = c.p[i].ival;
+    }
+    if (hd <= 0 || gqa <= 0 || bs <= 0 || q_len <= 0) {
+        fail("%s: the row's parameters name no head_dim, gqa, block_size or q_len", k->name);
+        return 1;
+    }
+    const long long kvh = 2, nh = kvh * gqa, ctx = 40, nb = (ctx + bs - 1) / bs;
+    const long long slot = 2 * hd + 4, row = nh * hd;
+    const long long pitch = std::strncmp(k->op, "attn_paged_qrow", 15) ? row : 2 * row;
+    uint32_t st = 0x18C0DE5u;
+    auto unit = [&]() { return (float)(xorshift(st) >> 8) / 8388608.0f - 1.0f; };   /* [-1, 1) */
+
+    std::vector<uint16_t> q((size_t)(q_len * pitch), (uint16_t)0x7FC0u);
+    for (long long m = 0; m < q_len; ++m)
+        for (long long e = 0; e < row; ++e) q[(size_t)(m * pitch + e)] = f32_to_bf16(unit());
+    std::vector<uint8_t> kv((size_t)(nb * kvh * bs * slot));
+    for (long long i = 0; i < nb * kvh * bs; ++i) {
+        uint8_t* p = kv.data() + i * slot;
+        for (long long e = 0; e < 2 * hd; ++e) p[e] = (uint8_t)(int8_t)(unit() * 127.0f);
+        /* K's scale, then V's: a head's absmax / 127 for values of about 1 and of about 2. */
+        const uint16_t ks = f32_to_f16((1.0f + 0.25f * (float)(i % 3)) / 127.0f);
+        const uint16_t vs = f32_to_f16((2.0f + 0.5f * (float)(i % 5)) / 127.0f);
+        std::memcpy(p + 2 * hd, &ks, 2);
+        std::memcpy(p + 2 * hd + 2, &vs, 2);
+    }
+    std::vector<int32_t> bt((size_t)nb), su = { (int32_t)ctx };
+    for (long long b = 0; b < nb; ++b) bt[(size_t)b] = (int32_t)(nb - 1 - b);
+    std::vector<uint16_t> out((size_t)(q_len * row), (uint16_t)0x7FC0u);
+
+    const struct { const void* src; size_t bytes; } pl[4] = {
+        { q.data(), q.size() * 2 }, { kv.data(), kv.size() }, { bt.data(), bt.size() * 4 },
+        { su.data(), su.size() * 4 } };
+    void* d[5] = {};
+    for (int o = 0; o < 5; ++o) {
+        const size_t bytes = o < 4 ? pl[o].bytes : out.size() * 2;
+        if (hipMalloc(&d[o], bytes) != hipSuccess) { fail("%s: hipMalloc(%zu) failed", k->name,
+                                                          bytes); return 1; }
+        c.dev.push_back(d[o]);
+        if (hipMemcpy(d[o], o < 4 ? pl[o].src : out.data(), bytes, hipMemcpyHostToDevice) !=
+            hipSuccess) { fail("%s: hipMemcpy in failed", k->name); return 1; }
+    }
+    for (int o = 0; o < 8; ++o) c.t[o] = RadTensor{};   /* no descales, no cu_seqlens */
+    RadTensor& tq = c.t[0];
+    tq.data = d[0]; tq.dtype = RAD_BF16; tq.rank = 3;
+    tq.shape[0] = q_len; tq.shape[1] = nh; tq.shape[2] = hd;
+    tq.stride[0] = pitch; tq.stride[1] = hd; tq.stride[2] = 1;
+    RadTensor& tk = c.t[1];
+    tk.data = d[1]; tk.dtype = RAD_I8; tk.rank = 4;
+    tk.shape[0] = nb; tk.shape[1] = kvh; tk.shape[2] = bs; tk.shape[3] = slot;
+    tk.stride[0] = kvh * bs * slot; tk.stride[1] = bs * slot; tk.stride[2] = slot; tk.stride[3] = 1;
+    RadTensor& tb = c.t[2];
+    tb.data = d[2]; tb.dtype = RAD_I32; tb.rank = 2;
+    tb.shape[0] = 1; tb.shape[1] = nb; tb.stride[0] = nb; tb.stride[1] = 1;
+    RadTensor& ts = c.t[3];
+    ts.data = d[3]; ts.dtype = RAD_I32; ts.rank = 1; ts.shape[0] = 1; ts.stride[0] = 1;
+    RadTensor& to = c.t[7];
+    to = tq;
+    to.data = d[4]; to.stride[0] = row;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ a row with no shape hook
@@ -2550,6 +2644,7 @@ static int run_row(int i) {
         : (0 == std::strcmp(k->name, "gemm_nt_q_w2a8_m16")) ? 1
         : (0 == std::strcmp(k->name, "gemm_nt_q_w4a16asym_m64")) ? 3
         : (0 == std::strcmp(k->name, "gemm_nt_q_w5a16_m64")) ? 4
+        : is_attn_i8kv_row(k) ? 30
         : (0 == std::strcmp(k->name, "gdn_kkt_solve_c64")) ? 5
         : (0 == std::strcmp(k->name, "gdn_chunk_scan_k128_v128_c64")) ? 6
         : (0 == std::strcmp(k->name, "gdn_gated_rmsnorm_h128")) ? 7
@@ -2583,6 +2678,7 @@ static int run_row(int i) {
         const int rc = hand == 1 ? build_w2a8(c, s)
                         : hand == 3 ? build_w4a16asym(c, s)
                         : hand == 4 ? build_w5a16(c, s)
+                        : hand == 30 ? build_attn_i8kv(c, k, s)
                         : hand == 5 ? build_gdn_kkt(c, s)
                         : hand == 7 ? build_gdn_gated_rmsnorm(c, s)
                         : hand == 8 ? build_gdn_gated_norm_hq(c, s)
