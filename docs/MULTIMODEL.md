@@ -634,6 +634,8 @@ When a load needs room, candidates are the resident models without `pin`, sorted
    back cheaply leaves before one that does not.
 
 A model with an idle `ttl` parks after that long without requests, whether or not room is needed.
+A scrape of the fleet-wide `/metrics` route is not a request in this sense, and neither is a
+dashboard read: neither restarts the idle clock.
 Groups bind (§8.5). A busy candidate is drained, bounded by `drain-timeout`.
 
 A model serving requests keeps its cards for a **quantum** after it came on (four times what coming

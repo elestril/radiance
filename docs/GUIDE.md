@@ -4544,7 +4544,8 @@ there is none.
 
 ### 6.3 Metrics
 
-`GET /metrics` is Prometheus text, in two families.
+`GET /metrics` is Prometheus text, in two families. A scrape never counts as a use of a model: a
+model with an idle `ttl` goes idle under a scraper, as it does under an open dashboard page (§6.1).
 
 **`vllm:`**, the compatibility set, so existing dashboards work: `num_requests_running`,
 `num_requests_waiting`, `num_preemptions_total`, `gpu_cache_usage_perc`, `kv_cache_usage_perc`,

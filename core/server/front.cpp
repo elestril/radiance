@@ -574,13 +574,15 @@ static bool wants_stream(const HttpRequest& q) {
            q.body.compare(b, e - b, "true") == 0;
 }
 
-std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open(bool include_draining_jobs) {
+std::vector<std::pair<Front::Entry*, std::shared_ptr<void>>> Front::hold_open(bool include_draining_jobs,
+                                                                              bool quiet) {
     std::vector<std::pair<Entry*, std::shared_ptr<void>>> held;
     std::lock_guard<std::mutex> lk(mu_);
     for (auto& p : entries_)
         if (!p->removed && p->server &&
             (p->state == State::Open || (include_draining_jobs && p->state == State::Closing)))
-            held.emplace_back(p.get(), include_draining_jobs ? lease_quiet(p.get()) : lease_entry(p.get()));
+            held.emplace_back(p.get(), include_draining_jobs || quiet ? lease_quiet(p.get())
+                                                                      : lease_entry(p.get()));
     return held;
 }
 
@@ -948,7 +950,8 @@ HttpResponse Front::health(const HttpRequest& q) {
 HttpResponse Front::metrics(const HttpRequest& q) {
     std::vector<std::string> texts;
     std::string type;
-    for (auto& [e, hold] : hold_open()) {
+    /* Quiet: a scrape (Prometheus, a router's stats poll) is not a use of the model. */
+    for (auto& [e, hold] : hold_open(/*include_draining_jobs=*/false, /*quiet=*/true)) {
         HttpResponse r = e->server->router().dispatch(q);
         if (r.status != 200) continue;
         if (type.empty()) type = r.content_type;
