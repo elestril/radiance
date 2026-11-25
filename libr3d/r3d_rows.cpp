@@ -3217,8 +3217,9 @@ static const RadKernelInfo kKernels[] = {
   "a[M,K] @ b[N,K]^T at prefill heights, f32 accumulate, one narrowing at the store",
   "the tune's impl axis picks the kernel: 0 = 128x128 tiles through LDS, 8x8 f32 accumulators a "
   "lane, k ascending in 32-code chunks, the partials closed in the tile; 1 = the same tile, the bf16 "
-  "decode in registers (the per-byte ALU formula); 2 = the same tile on the wave-matrix (eight 16x16 "
-  "tiles a wave); 3 = the 16-column-tile wave-matrix kernel, MT 16-row tiles a block (the M = 17..127 "
+  "decode in registers (the per-byte ALU formula); 2 = the same tile on the wave-matrix (libhalo's "
+  "tiled shape where K % 64: a wave a 64x32 patch, K staged 64 deep, the next tile in registers; "
+  "else eight 16x16 tiles a wave); 3 = the 16-column-tile wave-matrix kernel, MT 16-row tiles a block (the M = 17..127 "
   "band); M <= 16 stays with gemm_nt_bf16_m16, whose wave-per-run-of-columns "
   "shape is the right one there -- the two rows' M ranges are complements, so neither competes for "
   "the other's band",

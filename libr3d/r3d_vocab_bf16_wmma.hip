@@ -99,6 +99,129 @@ __global__ __launch_bounds__(kThreads) R3D_WAVES(kWaves) void vocab_bf16_wmma_ke
         }
 }
 
+/* The same 128x128 tile in libhalo's halo_gemm_bf16_nt_tiled shape, where K % 64 == 0: eight waves
+ * as 2 (M) x 4 (N), each a 64 x 32 patch (4 x 2 wave-matrix tiles), so a k step reads six
+ * fragments for eight WMMAs where the kernel above reads nine for eight; K staged 64 deep with
+ * 16-byte loads, the next tile's loaded into registers while this one multiplies, and blocks taken
+ * in groups of eight M bands so blocks in flight share their weight tiles in L2. Each output is the
+ * kernel above's chain -- one WMMA per 16 of K in ascending order from zero, the same operands in
+ * the same slots -- so the two store the same bytes. The barriers order LDS only: a workgroup fence
+ * over every address space would wait for the next tile's loads. */
+constexpr int kT2K = 64;                 // K a staged tile: four wave-matrix steps
+constexpr int kT2P = kT2K + 8;           // bf16 a staged row: 144 bytes, 16-byte aligned
+
+__device__ __forceinline__ void t2_barrier()
+{
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+
+__device__ __forceinline__ v16short t2_frag(const uint16_t* p)
+{
+    const r3d_u32x4 lo = *(const r3d_u32x4*)p, hi = *(const r3d_u32x4*)(p + 8);
+    typedef unsigned int u32x8 __attribute__((ext_vector_type(8)));
+    return __builtin_bit_cast(v16short, u32x8{ lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w });
+}
+
+__global__ __launch_bounds__(kThreads) void gemm_bf16_t2_kernel(
+    const uint16_t* __restrict__ a, const uint16_t* __restrict__ w, uint16_t* __restrict__ y,
+    int M, int N, int K, int a_ld, int w_ld, int y_ld)
+{
+    constexpr int TM = 4, TN = 2, CPR = kT2K / 8;         // 16-byte chunks a staged row
+    constexpr int AL = kTM * CPR / kThreads, WL = kTN * CPR / kThreads;
+    __shared__ __align__(16) uint16_t sA[kTM * kT2P];
+    __shared__ __align__(16) uint16_t sW[kTN * kT2P];
+
+    const int tid = (int)threadIdx.x, lane = tid & (kWave - 1);
+    const int wave = __builtin_amdgcn_readfirstlane(tid / kWave);
+    const int wm = wave / 4, wn = wave % 4;
+
+    // Groups of eight M bands, M fastest within a group (libhalo's remap).
+    constexpr unsigned kGroupM = 8;
+    const unsigned per = kGroupM * gridDim.x, lin = blockIdx.y * gridDim.x + blockIdx.x;
+    const unsigned first = lin / per * kGroupM, rr = lin % per;
+    const unsigned gm = min(gridDim.y - first, kGroupM);
+    const int m0 = (int)(first + rr % gm) * kTM, n0 = (int)(rr / gm) * kTN;
+
+    const uint16_t* asrc[AL];
+    const uint16_t* wsrc[WL];
+    int adst[AL], wdst[WL];
+#pragma unroll
+    for (int i = 0; i < AL; ++i) {
+        const int c = tid + kThreads * i, r = c / CPR, e = (c % CPR) * 8;
+        const int gr = m0 + r < M ? m0 + r : M - 1;
+        asrc[i] = a + (size_t)gr * a_ld + e;
+        adst[i] = r * kT2P + e;
+    }
+#pragma unroll
+    for (int i = 0; i < WL; ++i) {
+        const int c = tid + kThreads * i, r = c / CPR, e = (c % CPR) * 8;
+        const int gr = n0 + r < N ? n0 + r : N - 1;
+        wsrc[i] = w + (size_t)gr * w_ld + e;
+        wdst[i] = r * kT2P + e;
+    }
+    const uint16_t* fa = sA + (wm * TM * 16 + (lane & 15)) * kT2P;
+    const uint16_t* fw = sW + (wn * TN * 16 + (lane & 15)) * kT2P;
+
+    v8float acc[TM][TN];
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) acc[i][j] = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
+
+    r3d_u32x4 ra[AL], rw[WL];
+#pragma unroll
+    for (int i = 0; i < AL; ++i) ra[i] = *(const r3d_u32x4*)asrc[i];
+#pragma unroll
+    for (int i = 0; i < WL; ++i) rw[i] = *(const r3d_u32x4*)wsrc[i];
+
+    const int nk = K / kT2K;
+    for (int kt = 0; kt < nk; ++kt) {
+        t2_barrier();                                    // the last tile's fragments are all read
+#pragma unroll
+        for (int i = 0; i < AL; ++i) *(r3d_u32x4*)(sA + adst[i]) = ra[i];
+#pragma unroll
+        for (int i = 0; i < WL; ++i) *(r3d_u32x4*)(sW + wdst[i]) = rw[i];
+        t2_barrier();
+        if (kt + 1 < nk) {
+            const int k1 = (kt + 1) * kT2K;
+#pragma unroll
+            for (int i = 0; i < AL; ++i) ra[i] = *(const r3d_u32x4*)(asrc[i] + k1);
+#pragma unroll
+            for (int i = 0; i < WL; ++i) rw[i] = *(const r3d_u32x4*)(wsrc[i] + k1);
+        }
+#pragma unroll
+        for (int st = 0; st < kT2K / 16; ++st) {
+            v16short af[TM], bf[TN];
+#pragma unroll
+            for (int i = 0; i < TM; ++i) af[i] = t2_frag(fa + i * 16 * kT2P + st * 16);
+#pragma unroll
+            for (int j = 0; j < TN; ++j) bf[j] = t2_frag(fw + j * 16 * kT2P + st * 16);
+#pragma unroll
+            for (int i = 0; i < TM; ++i)
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = wmma_bf16(af[i], bf[j], acc[i][j]);
+            /* A step's fragment reads, then its products (libhalo: 6-9% on this tile). */
+            __builtin_amdgcn_sched_group_barrier(0x100, TM + TN, 0);
+            __builtin_amdgcn_sched_group_barrier(0x008, TM * TN, 0);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < TM; ++i)
+#pragma unroll
+        for (int j = 0; j < TN; ++j) {
+            const int n = n0 + (wn * TN + j) * 16 + (lane & 15);
+            const int mb = m0 + (wm * TM + i) * 16;
+#pragma unroll
+            for (int g = 0; g < 8; ++g) {
+                const int m = mb + 2 * g + (lane >> 4);
+                if (m < M && n < N) y[(size_t)m * y_ld + n] = f32_to_bf16(acc[i][j][g]);
+            }
+        }
+}
+
 int r3d_vocab_bf16_wmma(long av, long wv, long yv, int M, int N, int K, int a_ld, int w_ld,
                         int y_ld, long stream)
 {
@@ -117,7 +240,10 @@ int r3d_vocab_bf16_wmma(long av, long wv, long yv, int M, int N, int K, int a_ld
     hipStream_t s = (hipStream_t)(uintptr_t)stream;
 
     dim3 grid((unsigned)(N + kTN - 1) / kTN, (unsigned)(M + kTM - 1) / kTM), blk(kThreads);
-    vocab_bf16_wmma_kernel<<<grid, blk, 0, s>>>(a, w, y, M, N, K, a_ld, w_ld, y_ld);
+    if (K % kT2K == 0 && (a_ld % 8) == 0 && (w_ld % 8) == 0)
+        gemm_bf16_t2_kernel<<<grid, blk, 0, s>>>(a, w, y, M, N, K, a_ld, w_ld, y_ld);
+    else
+        vocab_bf16_wmma_kernel<<<grid, blk, 0, s>>>(a, w, y, M, N, K, a_ld, w_ld, y_ld);
     return (int)hipGetLastError();
 }
 

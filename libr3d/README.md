@@ -233,7 +233,11 @@ The GEMM band is covered by row count:
   with the bf16 decode in registers (the per-byte ALU formula), 2 = the same tile on the wave
   matrix (eight 16x16 tiles a wave, 64 f32 accumulators, k in 32-code chunks -- every wave owns
   unique columns, so no wave re-runs a tile; the compute-dual of arm 0, with the multiply on the
-  wave-matrix pipe), 3 = the 16-column-tile wave-matrix kernel for the 17..127 band (MT 16-row
+  wave-matrix pipe; where K % 64 == 0 the tile is libhalo's `halo_gemm_bf16_nt_tiled` shape, a wave a
+  64x32 patch of 4x2 tiles, K staged 64 deep with the next tile loaded into registers, blocks in
+  groups of eight M bands, the same chain per output and so the same bytes: on the 26B-A4B's
+  2048-row projections 54-77 TF/s against 23-30 for the eight-tile wave, RX 7900 XT), 3 = the
+  16-column-tile wave-matrix kernel for the 17..127 band (MT 16-row
   tiles a block, one 16-column tile a wave across the row tiles, k ascending in 16-wide
   wave-matrix steps; the B-fragment is loaded once a step and reused over the row tiles, so the
   weight stream is read once per 16-column tile; split-K over scratch, the partials reduced in
