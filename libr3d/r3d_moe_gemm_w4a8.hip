@@ -301,6 +301,192 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_e4m3_kernel
     }
 }
 
+/* --------------------------------------------- E4M3 arm, decode GEMV (fdot2, one run a block)
+ *
+ * At decode a run is one to a few rows and the 16x128 block above is latency-bound: 22 staged
+ * k tiles behind a barrier each. Here block (x, y) takes the y-th non-empty expert run and a
+ * slice of its columns. The run's activation rows (kGvRows at a time) are decoded once into LDS as
+ * exact f16 pairs (k, k+1). A lane owns one (column, 128-block of K): it loads the block's 64
+ * bytes of packed weight, decodes the nibbles to f16 with the 0x6400 magic and runs one fdot2
+ * chain over the block in ascending k; a weight group closes as the reference closes it,
+ * (dot * a_scale[src][b]) * w_scale[e][n][group]; and the column's group terms are added in
+ * ascending group order by a readlane walk over the lanes that hold them. So the order is the
+ * reference's: k ascending, one accumulator a group and one a column; the only difference is
+ * fdot2's one rounding a pair (the dot2 rows' documented difference, README "Numerics"). A dropped
+ * token-order slot (sorted < 0) is left as the caller set it, as in the reference; a sorted-order
+ * row is computed. */
+constexpr int kGvRows = 4;              // activation rows a pass over LDS
+
+__device__ __forceinline__ uint32_t e4m3x2_f16x2(uint32_t v)
+{
+    // v holds an E4M3 code in bits 8..15 of each half; the result is the two codes as exact f16.
+    const uint32_t h = (v & 0x80008000u) | ((v >> 1) & 0x3f803f80u);   // value * 2^-8
+    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+    const h2 s = __builtin_bit_cast(h2, h) * h2{ (_Float16)256.0f, (_Float16)256.0f };
+    return __builtin_bit_cast(uint32_t, s);
+}
+
+__device__ __forceinline__ float readlane_f(float v, int l)
+{
+    return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), l));
+}
+
+template <int WG, int CS>
+__global__ __launch_bounds__(kThreads) void moe_w4a8_e4m3_gemv_kernel(
+    const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+    const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
+    uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
+    int n_expert, int top_k, int a_sorted, int a_rows)
+{
+    constexpr int TPL = kGroup / WG;     // weight groups (scale folds) a lane's block holds
+    R3D_DYN_LDS(uint32_t, s_act);        // kGvRows rows x K/2 dwords of f16 pairs
+    __shared__ float s_sa[kGvRows][32];  // a_scale of the rows, K/128 <= 32
+
+    const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
+
+    // The y-th non-empty expert run, ranked by every wave on its own (ballots over the offsets, no
+    // barrier), so the weight loads below go out as soon as the run is known.
+    int e = -1, rs = 0, re = 0;
+    {
+        int base = 0;
+        for (int e0 = 0; e0 < n_expert && e < 0; e0 += kWave) {
+            const int ee = e0 + (int)lane;
+            const int o0 = ee < n_expert ? off[ee] : 0, o1 = ee < n_expert ? off[ee + 1] : 0;
+            const uint32_t bal = (uint32_t)__ballot(ee < n_expert && o1 > o0);
+            const int cnt = __popc(bal);
+            if (base + cnt > (int)blockIdx.y) {
+                uint32_t m = bal;
+                for (int t = 0; t < (int)blockIdx.y - base; ++t) m &= m - 1u;
+                const int l = __ffs((int)m) - 1;
+                e = e0 + l;
+                rs = __builtin_amdgcn_readlane(o0, l);
+                re = __builtin_amdgcn_readlane(o1, l);
+            }
+            base += cnt;
+        }
+    }
+    if (e < 0) return;
+    re = re < T ? re : T;
+
+    const int cls = e & 1, e2 = e >> 1;
+    const uint8_t* wbase = r3d_tab_at(tw.w[cls], e2);
+    const int w_ld = tw.w[cls].ld;
+    const uint16_t* wsb = (const uint16_t*)r3d_tab_at(tw.s[cls], e2);
+    const int ws_ld = tw.s[cls].ld;
+    const int nb = K / kGroup;               // lanes a column
+    const int cpw = kWave / nb;              // columns a wave a column set
+    const int cl = (int)lane / nb, b = (int)lane % nb;
+    const bool live_lane = cl < cpw;
+    const int col0 = (int)blockIdx.x * (kWaves * cpw * CS) + (int)wave * cpw * CS;
+
+    // The lane's weight: CS columns' 128-block b, 64 bytes each, and the block's scales.
+    r3d_u32x4 w[CS][4];
+    float sw[CS][TPL];
+#pragma unroll
+    for (int c = 0; c < CS; ++c) {
+        int n = col0 + c * cpw + cl;
+        n = (live_lane && n < N) ? n : N - 1;
+        const uint8_t* wp = wbase + (size_t)n * w_ld / 2 + (size_t)b * 64;
+#pragma unroll
+        for (int t = 0; t < 4; ++t)
+            w[c][t] = __builtin_nontemporal_load(
+                (const __attribute__((address_space(1))) r3d_u32x4*)(wp + 16 * t));
+#pragma unroll
+        for (int t = 0; t < TPL; ++t) sw[c][t] = bf16_f32(wsb[(size_t)n * ws_ld + b * TPL + t]);
+    }
+
+    for (int r0 = rs; r0 < re; r0 += kGvRows) {
+        const int nr = (re - r0) < kGvRows ? re - r0 : kGvRows;
+        // Every thread reads the chunk's sources itself (a few shared words), no barrier.
+        int s_src[kGvRows];
+#pragma unroll
+        for (int j = 0; j < kGvRows; ++j) {
+            int src = -1;
+            if (j < nr) {
+                const int i = r0 + j;
+                // The reference's rule: a token-order row with a dropped slot (or one past a's
+                // rows) is left as the caller set it; a sorted-order row is always computed.
+                src = a_sorted ? i : (sorted[i] >= 0 ? sorted[i] / top_k : -1);
+                if (src >= a_rows) src = -1;
+            }
+            s_src[j] = src;
+        }
+        // Decode the rows: one 8-code chunk a thread a turn, as the f16 pairs (k, k+1).
+        for (int j = 0; j < nr; ++j) {
+            const int src = s_src[j] < 0 ? 0 : s_src[j];
+            const uint8_t* ar = a + (size_t)src * a_ld;
+            for (int c8 = (int)tid; c8 < K / 8; c8 += kThreads) {
+                const uint2 x = *(const uint2*)(ar + 8 * c8);
+                r3d_u32x4 o;
+                o.x = e4m3x2_f16x2(__builtin_amdgcn_perm(x.x, x.x, 0x010c000cu));
+                o.y = e4m3x2_f16x2(__builtin_amdgcn_perm(x.x, x.x, 0x030c020cu));
+                o.z = e4m3x2_f16x2(__builtin_amdgcn_perm(x.y, x.y, 0x010c000cu));
+                o.w = e4m3x2_f16x2(__builtin_amdgcn_perm(x.y, x.y, 0x030c020cu));
+                *(r3d_u32x4*)(s_act + (size_t)j * (K / 2) + 4 * c8) = o;
+            }
+            for (int bb = (int)tid; bb < nb; bb += kThreads) s_sa[j][bb] = a_scale[(size_t)src * as_ld + bb];
+        }
+        group_barrier();
+
+        for (int j = 0; j < nr; ++j) {
+            const int src = s_src[j];
+            if (src < 0) continue;
+            const float sa = s_sa[j][b];
+            const uint32_t* ap = s_act + (size_t)j * (K / 2) + (size_t)b * 64;
+            float term[CS][TPL];
+            float d[CS];
+#pragma unroll
+            for (int c = 0; c < CS; ++c) d[c] = 0.f;
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {   // 32 codes a step, ascending k
+                const r3d_u32x4 a0 = *(const r3d_u32x4*)(ap + 16 * t);
+                const r3d_u32x4 a1 = *(const r3d_u32x4*)(ap + 16 * t + 4);
+                const r3d_u32x4 a2 = *(const r3d_u32x4*)(ap + 16 * t + 8);
+                const r3d_u32x4 a3 = *(const r3d_u32x4*)(ap + 16 * t + 12);
+                const uint32_t af[16] = { a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w,
+                                          a2.x, a2.y, a2.z, a2.w, a3.x, a3.y, a3.z, a3.w };
+#pragma unroll
+                for (int c = 0; c < CS; ++c) {
+                    typedef _Float16 h2 __attribute__((ext_vector_type(2)));
+                    const uint32_t wv4[4] = { w[c][t].x, w[c][t].y, w[c][t].z, w[c][t].w };
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        // A word's nibbles k..k+7 as the f16 pairs (k, k+1): (n ^ 8) | 0x6400 is
+                        // 1032 + n, the low nibble of byte i the even k.
+                        const uint32_t x = wv4[u] ^ 0x88888888u;
+                        const uint32_t lo = x & 0x0f0f0f0fu, hi = (x >> 4) & 0x0f0f0f0fu;
+#pragma unroll
+                        for (int i = 0; i < 4; ++i) {
+                            const uint32_t hb = __builtin_amdgcn_perm(hi, lo, 0x0c040c00u + 0x00010001u * i) | 0x64006400u;
+                            const h2 hv = __builtin_bit_cast(h2, hb) - h2{ (_Float16)1032.0f, (_Float16)1032.0f };
+                            d[c] = __builtin_amdgcn_fdot2(__builtin_bit_cast(h2, af[4 * u + i]), hv, d[c], false);
+                        }
+                    }
+                    if (WG == 32) { term[c][t % TPL] = (d[c] * sa) * sw[c][t % TPL]; d[c] = 0.f; }
+                }
+            }
+            if (WG == 128) {
+#pragma unroll
+                for (int c = 0; c < CS; ++c) term[c][0] = (d[c] * sa) * sw[c][0];
+            }
+            // Each column's group terms, added in ascending group order: lane (cl, b) holds the
+            // terms of block b.
+#pragma unroll
+            for (int c = 0; c < CS; ++c) {
+                for (int cc = 0; cc < cpw; ++cc) {
+                    float acc = 0.f;
+                    for (int bb = 0; bb < nb; ++bb)
+#pragma unroll
+                        for (int t = 0; t < TPL; ++t) acc = acc + readlane_f(term[c][t], cc * nb + bb);
+                    const int n = col0 + c * cpw + cc;
+                    if ((int)lane == cc * nb && n < N) y[(size_t)(r0 + j) * y_ld + n] = f32_to_bf16(acc);
+                }
+            }
+        }
+        group_barrier();   // the next row chunk's decode must not race these LDS reads
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -341,6 +527,27 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
      * spread a block's runs over grid.z, block z taking runs z, z + gridDim.z, ... Each run is
      * still one block's, accumulated in the same order, so the output is the same bytes; the
      * blocks past a block's run count leave after the setup. */
+    /* Decode (at most 32 sorted rows, an E4M3 activation, K <= 4096): the GEMV, one run a block. */
+    constexpr int kGvCS = 2;
+    if (c.a->dtype == RAD_F8E4M3 && c.T <= 32 && c.K / kGroup <= 32) {
+        long long ar = 0, ak = 0;
+        r3d_rows_of(c.a, &ar, &ak);
+        const int cpw = kWave / (int)(c.K / kGroup);
+        const int cols = kWaves * cpw * kGvCS;
+        const dim3 vgrid((unsigned)((c.N + cols - 1) / cols),
+                         (unsigned)(c.T < c.n_expert ? c.T : c.n_expert));
+        const size_t lds = (size_t)kGvRows * c.K * 2;
+        const uint8_t* pa8 = (const uint8_t*)r3d_p(c.a);
+        if (wg == 32)
+            R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<32, kGvCS>), vgrid, dim3(kThreads), lds, (hipStream_t)s,
+                          pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,
+                          (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar);
+        else
+            R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<128, kGvCS>), vgrid, dim3(kThreads), lds, (hipStream_t)s,
+                          pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,
+                          (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar);
+        return (int)hipGetLastError();
+    }
     if (grid.x * grid.y < 256u) grid.z = (unsigned)(c.T < mrows ? c.T : mrows);
     if (c.a->dtype == RAD_I8) {
         const int8_t* pa8 = (const int8_t*)r3d_p(c.a);

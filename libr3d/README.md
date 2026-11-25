@@ -363,7 +363,14 @@ int8, the native i32 wave matrix) with the scales folded per weight group — an
 of K and a bf16 w-scale per group. The experts are two tables by parity (even `w`/`w_scale`, odd `w_odd`/`w_odd_scale`), as
 every other `moe_gemm_q` dtype; `y` is bf16. Both token- and sorted-order `a`; the int8 arm folds
 each weight group's exact i32 product sum as `(sub * a_scale) * w_scale` in ascending group order, so
-it is bit-exact against the libref reference, and the e4m3 arm is the half-precision wave matrix.
+it is bit-exact against the libref reference, and the e4m3 arm is the half-precision wave matrix. At
+decode (at most 32 sorted rows, K <= 4096) the E4M3 arm is a GEMV instead: a block takes one expert
+run, the run's rows decoded once into LDS as exact f16, a lane one (column, 128-block) on an fdot2
+chain in ascending k, each group folded as the reference folds it and the column's group terms
+added in ascending group order by a readlane walk. rad-kbench does not reach the E4M3 arm (libref's
+shape hook describes the activation as int8), so it was checked against libref's
+`ref_moe_gemm_w4a8` with a standalone harness on routed batches (rel_l2 <= 2.4e-6, a few values
+1-20 bf16 ulps off near zero).
 The remaining weight forms (the nl64/nl32 magnitude-table nibbles), the prefill run map and the
 SK/UW/RS passes are outstanding, per its kernel header.
 
