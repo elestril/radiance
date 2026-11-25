@@ -242,6 +242,7 @@ struct Model {
      * against E4M3 ones (EXP_W4, exp_w4), every layer's: the code pairs are one buffer each for
      * the whole model. */
     bool    exp_i8 = false, exp_w4 = false, exp_seen = false;
+    int     exp_wg = RAD_FP8_BLOCK;   /* a four-bit expert's scale group: 128, or Q4_0's 32 */
     rad_buf b_hout = 0, b_logits = 0;
 
     rad_weight w_tok = 0, w_onorm = 0;
@@ -355,7 +356,7 @@ static int declare_dflash(RadBuilder* b, const RadModelMeta* meta, const RadBuil
  * codes, a bf16 scale per 128x128 block) is `moe_gemm_q` at fp8a8, four-bit (i4 codes, a bf16
  * scale per (row, 128 of K)) at w4a8. Anything else is refused by name. A builder with no model
  * behind it answers nothing, and the declared dtype bf16 is read. */
-enum { EXP_BF16 = 0, EXP_FP8 = 1, EXP_I8 = 2, EXP_W4 = 3 };
+enum { EXP_BF16 = 0, EXP_FP8 = 1, EXP_I8 = 2, EXP_W4 = 3, EXP_W4G32 = 4 };
 static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
     RadEncoding e{};
     *fmt = EXP_BF16;
@@ -375,18 +376,19 @@ static int expert_format(RadBuilder* b, const char* wn, int* fmt) {
         return RAD_OK;
     }
     /* Four-bit: two's-complement codes -8..7 with a bf16 scale per (row, 128 of K), unrotated
-     * (libquant's `codes=i4 group=128 scale=bf16`). */
+     * (libquant's `codes=i4 group=128 scale=bf16`), or per (row, 32 of K): Q4_0's block, which a
+     * QAT checkpoint is trained to (`group=32`). */
     if (rad_enc_is(&e, "affine") && e.n_planes == 2 && e.plane[0].dtype == RAD_I4 && sc &&
-        sc->dtype == RAD_BF16 && sc->block[0] == 1 && sc->block[1] == RAD_FP8_BLOCK &&
-        !e.transform[0]) {
-        *fmt = EXP_W4;
+        sc->dtype == RAD_BF16 && sc->block[0] == 1 &&
+        (sc->block[1] == RAD_FP8_BLOCK || sc->block[1] == 32) && !e.transform[0]) {
+        *fmt = sc->block[1] == 32 ? EXP_W4G32 : EXP_W4;
         return RAD_OK;
     }
     char en[256];
     rad_enc_format(&e, en, sizeof en);
     fprintf(stderr, "radiance: gemma4: '%s' is %s; the routed experts are served plain bf16, "
                     "block fp8 (fp8_e4m3*bf16[128x128]), rotated int8 "
-                    "(i8*bf16[1x128]/fwht128) or four-bit (i4*bf16[1x128]). Convert with no rule "
+                    "(i8*bf16[1x128]/fwht128) or four-bit (i4*bf16[1x128] or [1x32]). Convert with no rule "
                     "for them, or with `rtn codes=fp8_e4m3 block=128x128 scale=bf16`, `rtn "
                     "codes=i8 group=128 scale=bf16 transform=fwht128 clamp=sym rule=search` or "
                     "`rtn codes=i4 group=128 scale=bf16`.\n", wn, en);
@@ -404,8 +406,8 @@ static int layer_expert_format(RadBuilder* b, Names& nm, int64_t l, int64_t base
         RAD_ARCH_TRY(expert_format(b, wn, &f));
         if (e == 0) { *fmt = f; continue; }
         if (f != *fmt) {
-            static const char* const kName[4] = { "bf16", "block fp8", "rotated int8",
-                                                  "four-bit" };
+            static const char* const kName[5] = { "bf16", "block fp8", "rotated int8",
+                                                  "four-bit", "four-bit at group 32" };
             fprintf(stderr, "radiance: gemma4: '%s' is %s and expert %lld of the same layer is %s; "
                             "one layer's %s experts take one encoding (a recipe rule for them "
                             "matches all of a layer's or none)\n", wn, kName[f], (long long)base,
@@ -651,12 +653,15 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
             y.gu_q = fgu != EXP_BF16;
             y.dn_q = fdn != EXP_BF16;
             /* One quantised format for the model: the experts' code pairs are shared buffers. */
-            static const char* const kFmt[4] = { "bf16", "block fp8", "rotated int8", "four-bit" };
+            static const char* const kFmt[5] = { "bf16", "block fp8", "rotated int8", "four-bit",
+                                                 "four-bit at group 32" };
             for (const int f : { fgu, fdn }) {
                 if (f == EXP_BF16) continue;
-                const bool i8 = f == EXP_I8, w4 = f == EXP_W4;
-                if (m.exp_seen && (i8 != m.exp_i8 || w4 != m.exp_w4)) {
-                    const int was = m.exp_i8 ? EXP_I8 : m.exp_w4 ? EXP_W4 : EXP_FP8;
+                const bool i8 = f == EXP_I8, w4 = f == EXP_W4 || f == EXP_W4G32;
+                const int wg = f == EXP_W4G32 ? 32 : RAD_FP8_BLOCK;
+                if (m.exp_seen && (i8 != m.exp_i8 || w4 != m.exp_w4 || (w4 && wg != m.exp_wg))) {
+                    const int was = m.exp_i8 ? EXP_I8
+                                  : m.exp_w4 ? (m.exp_wg == 32 ? EXP_W4G32 : EXP_W4) : EXP_FP8;
                     fprintf(stderr, "radiance: gemma4: layer %lld's experts are %s and an earlier "
                                     "projection's %s; a model's quantised experts are all block "
                                     "fp8, all rotated int8 or all four-bit\n", ll, kFmt[f],
@@ -666,6 +671,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 m.exp_seen = true;
                 m.exp_i8 = i8;
                 m.exp_w4 = w4;
+                m.exp_wg = wg;
             }
             /* moe_gemm_q's geometry, refused here by name rather than as a kernel miss. It takes
              * experts as two tables by parity, so a rank must hold an even count. */
@@ -1107,7 +1113,7 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                             h = pass ? decl_view(b, nm.f("blk.%lld.ffn_%s_exps.%lld.scale", ll, what, ge),
                                                  wn, "scale", RAD_BF16,
                                                  {m.exp_i8 || m.exp_w4 ? rows : fp8_blocks(rows),
-                                                  fp8_blocks(cols)},
+                                                  m.exp_w4 ? cols / m.exp_wg : fp8_blocks(cols)},
                                                  RAD_ACCESS_CONDITIONAL, N,
                                                  grp_expert_slot(li, (int)e, slot))
                                      : decl_view(b, wn, nullptr, "codes", cdt, {rows, cols},
@@ -1220,7 +1226,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 /* `a_group` is stated to the int8 rows alone, last and cut off otherwise. */
                 const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", 2 * m.n_ffe),
                                         RAD_INT("K", E), RAD_INT("n_expert", NL),
-                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_INT("top_k", K),
+                                        RAD_INT("group", m.exp_w4 ? m.exp_wg : RAD_FP8_BLOCK),
                                         RAD_STR("a_order", "token"),
                                         RAD_STR("dtype", m.exp_i8 ? "i8a8h"
                                                          : m.exp_w4 ? "w4a8" : "fp8a8"),
@@ -1251,7 +1258,8 @@ static int declare(RadBuilder* b, const RadModelMeta* meta, const RadBuildCtx* c
                 const std::vector<rad_weight> tab = tables(y.w_edn, y.w_edns);
                 const RadParam ps[] = { RAD_RANGE("M", 1, P), RAD_INT("N", E),
                                         RAD_INT("K", m.n_ffe), RAD_INT("n_expert", NL),
-                                        RAD_INT("top_k", K), RAD_INT("group", RAD_FP8_BLOCK),
+                                        RAD_INT("top_k", K),
+                                        RAD_INT("group", m.exp_w4 ? m.exp_wg : RAD_FP8_BLOCK),
                                         RAD_STR("a_order", "sorted"),
                                         RAD_STR("dtype", m.exp_i8 ? "i8a8h"
                                                          : m.exp_w4 ? "w4a8" : "fp8a8"),

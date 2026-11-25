@@ -2378,15 +2378,17 @@ int ref_moe_gemm_w4a8_shape(const RadParam* p, int n_p, int operand, RadOpdDesc*
     const int64_t N = N0 > N1 ? N0 : N1, K = K0 > K1 ? K0 : K1;
     const int64_t ne0 = (ne + 1) / 2, ne1 = ne / 2;
     const int64_t AR = sorted_a_order(p, n_p) ? M * k : M;
+    /* The weight's scale group (128, or Q4_0's 32); the activation's stays per 128 of K. */
+    const int64_t wg = gi(p, n_p, "group", 128) == 32 ? 32 : 128;
     Opd o;
     o.t((uint32_t)RAD_I8, { AR, K });                    /* a -- int8 (the E4M3 arm is 8-bit too) */
     o.t((uint32_t)RAD_F32, { AR, K / 128 });             /* a_scale */
     o.t((uint32_t)RAD_I4, { ne0, N0, K0 });              /* w -- even experts, nibbles */
-    o.t((uint32_t)RAD_BF16, { ne0, N0, K0 / 128 });      /* w_scale */
+    o.t((uint32_t)RAD_BF16, { ne0, N0, K0 / wg });       /* w_scale */
     o.t_idx({ M * k }, M * k, -1, (uint32_t)RAD_OPD_F_IDX_UNIQUE);   /* sorted_tok */
     o.t_idx({ ne + 1 }, M * k + 1, -1, (uint32_t)RAD_OPD_F_IDX_PREFIX);   /* expert_offset */
     o.t((uint32_t)RAD_I4, { ne1, N1, K1 });              /* w_odd -- odd experts */
-    o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / 128 });      /* w_odd_scale */
+    o.t((uint32_t)RAD_BF16, { ne1, N1, K1 / wg });       /* w_odd_scale */
     o.t((uint32_t)RAD_BF16, { M * k, N });               /* y -- in sorted order */
     o.skip();                                         /* split -- optional */
     return o.finish("moe_gemm_q", operand, out);

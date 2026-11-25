@@ -793,15 +793,19 @@ int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
     const int64_t T = Y->rank >= 2 ? Y->shape[0] : 0;
     if (N <= 0 || K <= 0 || T <= 0 || K % 128) return RAD_E_SHAPE;
     if (p_int(a, "N", N) != N || p_int(a, "K", K) != K) return RAD_E_SHAPE;
+    /* The weight's scale group: 128 (one a block), or 32 (Q4_0's block, which a QAT checkpoint is
+     * trained to). The activation's scale is per 128 of K either way. */
+    const int64_t wg = p_int(a, "group", 128);
+    if (wg != 128 && wg != 32) return RAD_E_SHAPE;
 
     const int64_t n_even = (n_expert + 1) / 2, n_odd = n_expert / 2;
     if (W->rank < 3 || W->shape[0] < n_even || W->shape[1] < N || W->shape[2] < K) return RAD_E_SHAPE;
-    if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / 128)
+    if (WS->rank < 3 || WS->shape[0] < n_even || WS->shape[1] < N || WS->shape[2] < K / wg)
         return RAD_E_SHAPE;
     if (n_odd > 0) {
         if (WO->rank < 3 || WO->shape[0] < n_odd || WO->shape[1] < N || WO->shape[2] < K)
             return RAD_E_SHAPE;
-        if (WOS->rank < 3 || WOS->shape[0] < n_odd || WOS->shape[1] < N || WOS->shape[2] < K / 128)
+        if (WOS->rank < 3 || WOS->shape[0] < n_odd || WOS->shape[1] < N || WOS->shape[2] < K / wg)
             return RAD_E_SHAPE;
     }
     const int64_t M = A->rank >= 2 ? A->shape[0] : 0;
@@ -841,20 +845,22 @@ int ref_moe_gemm_w4a8(const RadArgs* a, RadStream) {
             const uint16_t* wsrow = wst + wsrow0 + (size_t)n * ws_ld;
             const float* asr = asp + src * (K / 128);
             float acc = 0.f;
-            for (int64_t b = 0; b < K / 128; ++b) {
-                const int64_t k0 = b * 128;
+            /* Each weight group's raw sum, folded as (sum * a_scale[b]) * w_scale[group] in
+             * ascending group order, b the group's 128-block. */
+            for (int64_t q = 0; q < K / wg; ++q) {
+                const int64_t k0 = q * wg, b = k0 / 128;
                 float term;
                 float wscale;
-                const uint32_t ws_bits = (uint32_t)wsrow[b] << 16;   /* bf16 -> f32: align to high 16 bits */
+                const uint32_t ws_bits = (uint32_t)wsrow[q] << 16;   /* bf16 -> f32: align to high 16 bits */
                 std::memcpy(&wscale, &ws_bits, 4);
                 if (e4m3) {
                     float dot = 0.f;
-                    for (int64_t k = 0; k < 128; ++k)
+                    for (int64_t k = 0; k < wg; ++k)
                         dot += fp8e4m3_to_f32(ap8[(size_t)src * a_ld + k0 + k]) * w4_code(wrow, k0 + k);
                     term = dot * asr[b] * wscale;
                 } else {
                     int32_t sub = 0;
-                    for (int64_t k = 0; k < 128; ++k)
+                    for (int64_t k = 0; k < wg; ++k)
                         sub += (int32_t)ap[(size_t)src * a_ld + k0 + k] * (int32_t)w4_code(wrow, k0 + k);
                     term = (float)sub * asr[b] * wscale;
                 }

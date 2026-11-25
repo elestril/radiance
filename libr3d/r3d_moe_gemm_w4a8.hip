@@ -1,6 +1,6 @@
 /* r3d_moe_gemm_w4a8.hip -- moe_gemm_q dtype w4a8: the grouped int4 GEMM over the expert-sorted rows.
  *
- *   y[T,N] = a[sorted_tok[i] / top_k, :] @ w[e(i)]^T, with a per-(row, 128-of-K) scale fold.
+ *   y[T,N] = a[sorted_tok[i] / top_k, :] @ w[e(i)]^T, with a scale fold per (row, weight group).
  *
  * The routed rows are in SORTED order (one row per (token, expert slot)); row i reads its
  * activation from `a[sorted_tok[i] / top_k]` (or a[i] under a_order "sorted") and its weight from
@@ -10,14 +10,15 @@
  * on the device (a pointer array or a stacked plane).
  *
  * The weight is two's-complement int4 (nibbles, -8..7) packed two per byte, with one bf16 scale per
- * (row, 128 of K); the output is bf16 in sorted order. Two arms, picked by the activation dtype:
+ * (row, weight scale group of K: `group` 128, or 32); the activation's scale is per (row, 128 of
+ * K). The output is bf16 in sorted order. Two arms, picked by the activation dtype:
  *   * int8 a  -> the native int8 wave-matrix (v_wmma_i32_16x16x16_iu8, exact i32 accumulate): the
  *     int4 weight is widened to int8, so no f16 rounding anywhere in the chain.
  *   * E4M3 a  -> the f16 wave-matrix (v_wmma_f32_16x16x16_f16, f32 accumulate): the E4M3 activation
  *     and the int4 weight are decoded exactly to f16 (libr4d's w4a8 form).
- * Each 128-wide block of K is accumulated raw, then folded by (sub * scale_a[src][b]) *
- * scale_w[e][n][b] in f32 -- the exact order the libref reference runs, so the int8 arm agrees bit
- * for bit.
+ * Each weight group of K is accumulated raw, then folded by (sub * scale_a[src][b]) *
+ * scale_w[e][n][g] in f32, b the group's 128-wide block of K -- the exact order the libref
+ * reference runs, so the int8 arm agrees bit for bit.
  *
  * A 16-row block walks the expert runs in its rows; where the grid is small (decode) the runs are
  * spread over grid.z, one block a run. STATUS: the w4a8 form is served (both activation arms). Remaining: the codebook NL forms
@@ -80,7 +81,7 @@ __device__ __forceinline__ void moe_w4a8_setup(
 
 /* ------------------------------------------------------------------ int8 arm (i32 wave-matrix) */
 
-template <int MR, int WV>
+template <int MR, int WV, int WG>
 __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_i8_kernel(
     const int8_t* __restrict__ a, const float* __restrict__ a_scale,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
@@ -154,17 +155,19 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_i8_kernel(
                           (int)((uint32_t)(v[12] & 0xFF) | (uint32_t)(v[13] & 0xFF) << 8 |
                             (uint32_t)(v[14] & 0xFF) << 16 | (uint32_t)(v[15] & 0xFF) << 24) };
                 sub = wmma_i8(v4int{ (int)aq.x, (int)aq.y, (int)aq.z, (int)aq.w }, bf, sub);
-            }
-
-            // Fold the 128-block's scales: (sub * scale_a[src][b]) * scale_w[e][n][b], libref's order.
-            const float sw = bf16_f32(wsb[(size_t)n_real * ws_ld + b]);
+                if ((k + 16) % WG) continue;
+                // Fold a weight group's scales: (sub * scale_a[src][b]) * scale_w[e][n][group],
+                // libref's order; WG 128 folds once a block, WG 32 four times.
+                const float sw = bf16_f32(wsb[(size_t)n_real * ws_ld + b * (kGroup / WG) + k / WG]);
 #pragma unroll
-            for (int g2 = 0; g2 < 8; ++g2) {
-                const int row = (int)(g2 * 2 + (lane >> 4));
-                const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) ? s_tok[row]
-                                                                                  : s_tok[rs - (int)r0];
-                const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * as_ld + b];
-                acc[g2] += (float)sub[g2] * sa * sw;
+                for (int g2 = 0; g2 < 8; ++g2) {
+                    const int row = (int)(g2 * 2 + (lane >> 4));
+                    const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) ? s_tok[row]
+                                                                                      : s_tok[rs - (int)r0];
+                    const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * as_ld + b];
+                    acc[g2] += (float)sub[g2] * sa * sw;
+                }
+                sub = v8int{ 0, 0, 0, 0, 0, 0, 0, 0 };
             }
             group_barrier();
         }
@@ -182,7 +185,7 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_i8_kernel(
 
 /* ------------------------------------------------------------- E4M3 arm (f16 wave-matrix) */
 
-template <int MR, int WV>
+template <int MR, int WV, int WG>
 __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_e4m3_kernel(
     const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
@@ -270,19 +273,21 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_e4m3_kernel
 #pragma unroll
                 for (int g = 0; g < 8; ++g) { fb[2 * g] = h16(bf[g] & 0xffffu); fb[2 * g + 1] = h16(bf[g] >> 16); }
                 blk = wmma_f16(fa, fb, blk);
+                if ((k + 16) % WG) continue;
+                // Fold a weight group's scales: (dot * scale_a[src][b]) * scale_w[e][n][group],
+                // libref's order; WG 128 folds once a block, WG 32 four times.
+                const float sw = bf16_f32(wsb[(size_t)n_real * ws_ld + b * (kGroup / WG) + k / WG]);
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    const int row = (int)(g * 2 + (lane >> 4));
+                    const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) ? s_tok[row]
+                                                                                      : s_tok[rs - (int)r0];
+                    const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * as_ld + b];
+                    acc[g] += blk[g] * sa * sw;
+                }
+                blk = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
             }
             group_barrier();
-
-            // Fold the 128-block's scales: (sub * scale_a[src][b]) * scale_w[e][n][b], libref's order.
-            const float sw = bf16_f32(wsb[(size_t)n_real * ws_ld + b]);
-#pragma unroll
-            for (int g = 0; g < 8; ++g) {
-                const int row = (int)(g * 2 + (lane >> 4));
-                const int src = (rs <= (int)(r0 + row) && (int)(r0 + row) < re) ? s_tok[row]
-                                                                                  : s_tok[rs - (int)r0];
-                const float sa = a_scale[(size_t)(src < 0 ? 0 : src) * as_ld + b];
-                acc[g] += blk[g] * sa * sw;
-            }
         }
 
         }
@@ -312,9 +317,13 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
     if (c.a->dtype != RAD_I8 && c.a->dtype != RAD_F8E4M3) return R3D_NO(RAD_E_DTYPE);
     if (c.a_scale->dtype != RAD_F32 || c.y->dtype != RAD_BF16) return R3D_NO(RAD_E_DTYPE);
     if (c.K % kGroup) return R3D_NO(RAD_E_SHAPE);   // the N tail clamps
+    /* The weight's scale group: 128 (one scale a block), or 32 (Q4_0's block, which a QAT
+     * checkpoint is trained to); the activation's scale stays per 128 of K. */
+    const long long wg = r3d_geti_or(a, "group", kGroup);
+    if (wg != 128 && wg != 32) return R3D_NO(RAD_E_SHAPE);
 
     R3dMoeTabs tw;
-    rc = r3d_moe_q_tabs(c, RAD_I4, 4, RAD_BF16, 16, c.N, c.K / kGroup, &tw);
+    rc = r3d_moe_q_tabs(c, RAD_I4, 4, RAD_BF16, 16, c.N, c.K / wg, &tw);
     if (rc != RAD_OK) return rc;
     const int a_ld = (int)c.a->stride[0], as_ld = (int)c.a_scale->stride[0];
     const int y_ld = (int)c.y->stride[0];
@@ -336,23 +345,23 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
     if (c.a->dtype == RAD_I8) {
         const int8_t* pa8 = (const int8_t*)r3d_p(c.a);
         if (mrows == 8 && wv == 4)
-            moe_w4a8_i8_kernel<8,4><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_i8_kernel<8,4,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_i8_kernel<8,4,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else if (mrows == 8)
-            moe_w4a8_i8_kernel<8,8><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_i8_kernel<8,8,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_i8_kernel<8,8,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else if (wv == 4)
-            moe_w4a8_i8_kernel<16,4><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_i8_kernel<16,4,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_i8_kernel<16,4,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else
-            moe_w4a8_i8_kernel<16,8><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_i8_kernel<16,8,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_i8_kernel<16,8,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
     } else {
         const uint8_t* pa8 = (const uint8_t*)r3d_p(c.a);
         if (mrows == 8 && wv == 4)
-            moe_w4a8_e4m3_kernel<8,4><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_e4m3_kernel<8,4,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_e4m3_kernel<8,4,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else if (mrows == 8)
-            moe_w4a8_e4m3_kernel<8,8><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_e4m3_kernel<8,8,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_e4m3_kernel<8,8,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else if (wv == 4)
-            moe_w4a8_e4m3_kernel<16,4><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_e4m3_kernel<16,4,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_e4m3_kernel<16,4,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
         else
-            moe_w4a8_e4m3_kernel<16,8><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted);
+            { if (wg == 32) moe_w4a8_e4m3_kernel<16,8,32><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); else moe_w4a8_e4m3_kernel<16,8,128><<<grid, blk, 0, (hipStream_t)s>>>( pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted); }
     }
     return (int)hipGetLastError();
 }

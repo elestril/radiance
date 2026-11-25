@@ -1470,8 +1470,11 @@ static const RadConstraint cIqrGateOddWide[] = IQR_GATE_CONSTRAINTS(512, 768);
 static const RadConstraint cIqrGateFull[] = IQR_GATE_CONSTRAINTS(1280, 1280);
 #undef IQR_GATE_CONSTRAINTS
 #endif
+/* The weight's scale group is 128 or 32. No constraint states a set of integers, so the row
+ * declares the range and the step between the two, and the launch refuses 64 and 96. */
 static const RadConstraint cMoeGemmQW4A8[] = { C_IN("dtype", "w4a8"), C_GE("n_expert", 1),
-                                               C_GE("top_k", 1) };
+                                               C_GE("top_k", 1), C_GE("group", 32),
+                                               C_LE("group", 128), C_DIV("group", 32) };
 static const RadConstraint cMoeGemmW4A4[] = { C_IN("dtype", "w4a4"), C_GE("n_expert", 1),
                                                 C_GE("top_k", 1) };
 static const RadConstraint cMoeGather[] = { C_GE("M", 1), C_GE("n", 1), C_GE("top_k", 1),
@@ -2495,21 +2498,22 @@ static const RadKernelInfo kKernels[] = {
   /* ------------------------------------------------------------------ r3d_moe_gemm_w4a8.hip
    *
    * The grouped int4 GEMM: the two's-complement int4 weight (nibbles, -8..7) against an int8 or
-   * E4M3 activation, one 128-block of K per scale fold. The int8 arm runs the exact i32 wave-matrix
+   * E4M3 activation, one scale fold a weight scale group of K (`group`: 128, or 32; the
+   * activation's scale is per 128 of K). The int8 arm runs the exact i32 wave-matrix
    * (no f16 rounding); the E4M3 arm the f16 wave-matrix (libr4d's form). A row of moe_gemm_q,
    * selected by dtype=w4a8; the even experts in `w` / `w_scale`, the odd in `w_odd` / `w_odd_scale`.
    */
   { "moe_gemm_w4a8", "moe_gemm_q", "moe",
    "The grouped int4 GEMM over the expert-sorted rows: y[i] = a[sorted_tok[i]/top_k] @ w_e^T, e the "
    "expert of sorted row i; the two's-complement int4 weight (nibbles, -8..7) against an int8 or "
-   "E4M3 activation, one 128-block of K per scale fold",
+   "E4M3 activation, one scale fold a weight scale group of K (`group`: 128, or 32)",
    "16 sorted rows per block, eight waves of 16 columns; the block walks its expert runs, the "
    "padding rows reading the run's first; the decode band (M * top_k <= 16 the tuned point, more "
    "runs as extra 16-row blocks, prefill falls back to libavx); K % 128, N % 64; the even experts "
    "are entry e/2 of `w` / `w_scale`, the odd of `w_odd` / `w_odd_scale`; token or sorted a",
-   "I4 (packed, two a byte) weight tables with a bf16 w_scale per (row, 128 of K); int8 a (an f32 "
-   "a_scale per (row, 128 of K)) or E4M3 a (an f32 a_scale); bf16 y in sorted order; the int8 arm is "
-   "bit-exact against the reference, the E4M3 arm to the f16 store ulp",
+   "I4 (packed, two a byte) weight tables with a bf16 w_scale per (row, `group` of K); int8 a (an "
+   "f32 a_scale per (row, 128 of K)) or E4M3 a (an f32 a_scale); bf16 y in sorted order; the int8 "
+   "arm is bit-exact against the reference, the E4M3 arm to the f16 store ulp",
    RAD_DOMAIN_DEVICE, R3D_PRIO_ONLY,
    ROW(cMoeGemmQW4A8), tMoeGemmQW4, NELEM(tMoeGemmQW4), nullptr,
    nullptr, nullptr, r3d_rad_moe_gemm_w4a8,

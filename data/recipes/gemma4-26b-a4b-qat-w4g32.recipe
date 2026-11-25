@@ -1,0 +1,20 @@
+# gemma4-26b-a4b-qat-w4g32.recipe -- Gemma 4 26B-A4B from Google's QAT release
+# (gemma-4-26B-A4B-it-qat-q4_0-unquantized: bf16 weights trained to fit Q4_0), every routed expert
+# at four bits on Q4_0's grid, the rest as the checkpoint ships it.
+#
+#   - Every routed expert's gate_up and down projection as two's-complement int4 codes (-8..7) with
+#     a bf16 scale per (row, 32 of K): Q4_0's block, which the QAT weights were trained to, so the
+#     round to nearest lands on the grid they were fitted for. moe_gemm_q at w4a8 group 32, against
+#     the E4M3 codes of the experts' inputs (an f32 scale per 128 of K).
+#   - As gemma4-26b-a4b-w4.recipe, the down projection's K (the expert width, 704) is not whole
+#     128-wide activation groups: pad the experts to 768 first (zero rows of gate and up, zero
+#     columns of down; the function is unchanged) and convert the padded checkpoint.
+#   - The scales per 32 cost 1.1 GiB more than per 128: about 18.6 GiB in all, which leaves a 20 GB
+#     card about 1 GiB for the KV cache and activations (fewer sequences or a shorter context than
+#     the group-128 container serves).
+#
+#   rad-convert <padded gemma-4-26B-A4B-it-qat-q4_0-unquantized> \
+#       --recipe data/recipes/gemma4-26b-a4b-qat-w4g32.recipe -o gemma4-26b-a4b-qat-w4g32.rad
+
+blk.*.ffn_gate_up_exps.*.weight      rtn codes=i4 group=32 scale=bf16
+blk.*.ffn_down_exps.*.weight         rtn codes=i4 group=32 scale=bf16
