@@ -43,6 +43,27 @@ target_link_libraries(rad_legacy_toolparse PUBLIC rad_core)
 target_include_directories(rad_legacy_toolparse PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/legacy)
 set(RAD_TESTS_WITH_LEGACY chatparse_test chatparse_gemma4_test)
 
+# libr3d's dense four-bit weight (gemm_nt_q at w4a8, Gemma 4 31B's trunk). The host test holds the
+# layout hooks to the order the kernels read and to their own inverse; the card test runs
+# gemm_w4a8_nt_m64 on a weight laid out by the row's hooks against a host product.
+add_executable(r3d_w4_layout_host r3d_w4_layout_host.cpp ../libr3d/r3dh_w4_layout.cpp)
+target_link_libraries(r3d_w4_layout_host PRIVATE radiance::abi)
+add_test(NAME r3d_w4_layout_host COMMAND r3d_w4_layout_host)
+set_tests_properties(r3d_w4_layout_host PROPERTIES LABELS unit)
+if(TARGET libr3d)
+  get_target_property(r3d_w4_targets libr3d HIP_ARCHITECTURES)
+  if(r3d_w4_targets STREQUAL "gfx1100")
+    add_executable(r3d_gemm_w4a8_gpu r3d_gemm_w4a8_gpu.cpp ../core/util/rad_util.cpp)
+    target_link_libraries(r3d_gemm_w4a8_gpu PRIVATE radiance::abi ${RAD_HIP_RUNTIME} ${CMAKE_DL_LIBS})
+    target_compile_options(r3d_gemm_w4a8_gpu PRIVATE -ffp-contract=off)
+    add_dependencies(r3d_gemm_w4a8_gpu libr3d)
+    add_test(NAME r3d_gemm_w4a8_catalogue COMMAND r3d_gemm_w4a8_gpu $<TARGET_FILE:libr3d> --catalogue-only)
+    set_tests_properties(r3d_gemm_w4a8_catalogue PROPERTIES LABELS unit)
+    add_test(NAME r3d_gemm_w4a8_gpu COMMAND r3d_gemm_w4a8_gpu $<TARGET_FILE:libr3d>)
+    set_tests_properties(r3d_gemm_w4a8_gpu PROPERTIES LABELS gpu RESOURCE_LOCK card SKIP_RETURN_CODE 77)
+  endif()
+endif()
+
 # relayout_parity_test checks each kernel library's relayout of libquant's planes against a
 # recorded hash of the stored bytes. libr4d's layout sources are host-only, so they are compiled in,
 # with -ffp-contract=off as libr4d uses, so scale conversions round identically.

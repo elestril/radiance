@@ -2542,7 +2542,8 @@ static int run_row(int i) {
         return 0;
     }
     if (!std::strcmp(k->name, "gemm_w4a8_nt_m64")) {
-        skip("the weight is read in its fragment-order layout; rad-kbench lays it out and checks it");
+        skip("the weight is read in its fragment-order layout; covered by r3d_w4_layout_host and "
+             "r3d_gemm_w4a8_gpu");
         return 0;
     }
     const int hand = k->opd_shape ? 0
