@@ -1,6 +1,7 @@
-/* Ported from libhalo/halo_encoder_bf16.hip, verbatim but for the halo_ -> r3dh_ rename (identifiers only), so
+/* Ported from libhalo/halo_encoder_bf16.hip with the halo_ -> r3dh_ rename (identifiers only), so
  * libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same wave32 16x16x16
- * WMMA family as gfx1100; the unit compiles for the family unchanged. */
+ * WMMA family as gfx1100; the unit compiles for the family unchanged. One thing is added to
+ * libhalo's file, marked `libr3d:`: act_mul's chained form (r3d_chain.h). */
 /* Derived from libr4d/r4d_encoder_bf16.hip by the libhalo rename transform (2026-10-26),
  * then ported to gfx1151; see libhalo/README.md. */
 // Small encoder ops between GEMMs and attention: gated activation over two operands, QK(V) norm +
@@ -11,6 +12,7 @@
 #include "r3dh.h"
 #include "r3dh_args.h"
 #include "r3dh_common.h"
+#include "r3d_chain.h"   /* libr3d: the chained forms of act_mul and qk_norm_rope */
 
 #include <algorithm>
 #include <cmath>
@@ -46,10 +48,11 @@ static inline uint32_t grid_rows(int64_t M) {
     return (uint32_t)(M < (int64_t)kGridYMax ? M : (int64_t)kGridYMax);
 }
 
-template <int ACT>
+template <int ACT, class CH = HaloUnchained>
 __global__ __launch_bounds__(kThreads) void act_mul_kernel(
     const uint16_t* __restrict__ a, const uint16_t* __restrict__ b, uint16_t* __restrict__ y,
     uint32_t n, uint32_t a_ld, uint32_t b_ld, uint32_t y_ld, uint32_t M) {
+    R3D_CHAIN_SCOPE(CH);   /* libr3d: a lane's return is past the only barrier, the add's */
     const uint32_t i = blockIdx.x * kThreads + threadIdx.x;
     if (i >= n) return;
     for (uint32_t m = blockIdx.y; m < M; m += gridDim.y) {
@@ -802,9 +805,9 @@ extern "C" int r3dh_act_mul_bf16(long a, long b, long y, int M, int n, int act, 
     if (M <= 0 || n <= 0 || act < 0 || act > 5) return -2;
     const dim3 grid((uint32_t)((n + kThreads - 1) / kThreads), grid_rows(M));
 #define R3DH_AM(A)                                                                               \
-    hipLaunchKernelGGL(act_mul_kernel<A>, grid, dim3(kThreads), 0, (hipStream_t)stream,         \
-                       (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,      \
-                       (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, (uint32_t)M)
+    R3D_CHAIN_LAUNCH(act_mul_kernel, (A,), grid, dim3(kThreads), (hipStream_t)stream,           \
+                     (const uint16_t*)a, (const uint16_t*)b, (uint16_t*)y, (uint32_t)n,        \
+                     (uint32_t)a_ld, (uint32_t)b_ld, (uint32_t)y_ld, (uint32_t)M)
     if (act == 0)      R3DH_AM(0);
     else if (act == 1) R3DH_AM(1);
     else if (act == 2) R3DH_AM(2);
@@ -1139,6 +1142,7 @@ static inline int enc_status(int rc) {
 
 /* ------------------------------------------------------------------ act_mul */
 extern "C" int r3dh_rad_act_mul(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     const RadTensor* A = r3dh_opt(a, 0);
     const RadTensor* B = r3dh_opt(a, 1);
     const RadTensor* Y = r3dh_opt(a, 2);

@@ -27,6 +27,7 @@
 #include "r3d_args.h"
 #include "r3d_codecs.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 
 namespace {
 
@@ -42,7 +43,7 @@ __device__ __forceinline__ float gather_weight(const void* ew, size_t i) {
 /* One enum arg (not two bools) so the launch macro sees a single, comma-free template argument. */
 enum class Gk { bf16_sorted, bf16_inv, f32_sorted, f32_inv };
 
-template <Gk MODE>
+template <Gk MODE, class CH = HaloUnchained>
 __global__ __launch_bounds__(kGatherThr) void gather_kernel(
     const uint16_t* __restrict__ ye, const void* __restrict__ ew,
     const int32_t* __restrict__ inv, uint16_t* __restrict__ y,
@@ -50,6 +51,7 @@ __global__ __launch_bounds__(kGatherThr) void gather_kernel(
     const int32_t* __restrict__ sorted, uint32_t T,
     const uint16_t* __restrict__ sh, const uint16_t* __restrict__ sg,
     uint32_t sh_ld, uint32_t sg_ld, int sig) {
+    R3D_CHAIN_SCOPE(CH);   /* the `t >= M` return is the whole block's */
     constexpr bool F32W = (MODE == Gk::f32_sorted || MODE == Gk::f32_inv);
     constexpr bool GIVEN = (MODE == Gk::bf16_inv || MODE == Gk::f32_inv);
     __shared__ int32_t s_i[kGatherSlots];
@@ -225,13 +227,14 @@ int r3d_rad_moe_gather(const RadArgs* a, RadStream s)
         return (int)hipGetLastError();
     }
     dim3 grid((unsigned)Mg, (unsigned)((n + kGatherThr - 1) / kGatherThr)), blk(kGatherThr);
+    HaloChainScope chain_(r3d_chain_rows(a, Mg));   /* the chained form at decode heights */
     if (f32w)
-        R3D_KLAUNCH(gather_kernel<Gk::f32_sorted>, grid, blk, (hipStream_t)s,
+        R3D_CHAIN_LAUNCH(gather_kernel, (Gk::f32_sorted,), grid, blk, (hipStream_t)s,
                     (const uint16_t*)r3d_p(ye), r3d_p(ew), (const int32_t*)r3d_p(sorted),
                     (uint16_t*)r3d_wp(y), (uint32_t)M, (uint32_t)n, (uint32_t)top_k, ye_ld, ew_ld,
                     y_ld, (const int32_t*)r3d_p(sorted), T, shp, sgp, sh_ld, sg_ld, sig);
     else
-        R3D_KLAUNCH(gather_kernel<Gk::bf16_sorted>, grid, blk, (hipStream_t)s,
+        R3D_CHAIN_LAUNCH(gather_kernel, (Gk::bf16_sorted,), grid, blk, (hipStream_t)s,
                     (const uint16_t*)r3d_p(ye), r3d_p(ew), (const int32_t*)r3d_p(sorted),
                     (uint16_t*)r3d_wp(y), (uint32_t)M, (uint32_t)n, (uint32_t)top_k, ye_ld, ew_ld,
                     y_ld, (const int32_t*)r3d_p(sorted), T, shp, sgp, sh_ld, sg_ld, sig);
@@ -275,13 +278,14 @@ int r3d_rad_moe_gather_inv(const RadArgs* a, RadStream s)
 
     const bool f32w = (ew->dtype == RAD_F32);
     dim3 grid((unsigned)M, (unsigned)((n + kGatherThr - 1) / kGatherThr)), blk(kGatherThr);
+    HaloChainScope chain_(r3d_chain_rows(a, M));   /* the chained form at decode heights */
     if (f32w)
-        R3D_KLAUNCH(gather_kernel<Gk::f32_inv>, grid, blk, (hipStream_t)s,
+        R3D_CHAIN_LAUNCH(gather_kernel, (Gk::f32_inv,), grid, blk, (hipStream_t)s,
                     (const uint16_t*)r3d_p(ye), r3d_p(ew), (const int32_t*)r3d_p(inv),
                     (uint16_t*)r3d_wp(y), (uint32_t)M, (uint32_t)n, (uint32_t)top_k, ye_ld, ew_ld,
                     y_ld, (const int32_t*)nullptr, T, shp, sgp, sh_ld, sg_ld, sig);
     else
-        R3D_KLAUNCH(gather_kernel<Gk::bf16_inv>, grid, blk, (hipStream_t)s,
+        R3D_CHAIN_LAUNCH(gather_kernel, (Gk::bf16_inv,), grid, blk, (hipStream_t)s,
                     (const uint16_t*)r3d_p(ye), r3d_p(ew), (const int32_t*)r3d_p(inv),
                     (uint16_t*)r3d_wp(y), (uint32_t)M, (uint32_t)n, (uint32_t)top_k, ye_ld, ew_ld,
                     y_ld, (const int32_t*)nullptr, T, shp, sgp, sh_ld, sg_ld, sig);

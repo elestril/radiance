@@ -18,15 +18,18 @@
 #include "r3d.h"
 #include "r3d_args.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 #include "r3d_codecs.h"
 
 namespace {
 
+template <class CH = HaloUnchained>
 __global__ __launch_bounds__(256) void escale_kernel(const int32_t* __restrict__ ids, long long ids_ld,
                                                      const unsigned short* __restrict__ sc,
                                                      unsigned short* __restrict__ ew, long long ew_ld,
                                                      long long rows, int k, int n_expert)
 {
+    R3D_CHAIN_SCOPE(CH);   /* a lane's return is past the only barrier, the add's */
     const long long e = (long long)blockIdx.x * 256 + threadIdx.x;
     if (e >= rows * k) return;
     const long long r = e / k;
@@ -68,9 +71,10 @@ int r3d_rad_expert_scale_bf16(const RadArgs* a, RadStream s)
     if (M <= 0) return 0;
     if (ri < M || M * k > 0x7fffffffLL) return R3D_NO(RAD_E_SHAPE);
     const unsigned blocks = (unsigned)((M * k + 255) / 256);
-    R3D_KLAUNCH(escale_kernel, dim3(blocks), dim3(256), (hipStream_t)s,
-                (const int32_t*)r3d_p(I), li, (const unsigned short*)r3d_p(S),
-                (unsigned short*)r3d_wp(W), lw, M, (int)k, (int)ne);
+    HaloChainScope chain_(r3d_chain_rows(a, M));   /* the chained form at decode heights */
+    R3D_CHAIN_LAUNCH(escale_kernel, (), dim3(blocks), dim3(256), (hipStream_t)s,
+                     (const int32_t*)r3d_p(I), li, (const unsigned short*)r3d_p(S),
+                     (unsigned short*)r3d_wp(W), lw, M, (int)k, (int)ne);
     return (int)hipGetLastError();
 }
 

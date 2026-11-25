@@ -35,6 +35,7 @@
 #include "r3d_codecs.h"
 #include "r3d_fp8_dequant.h"
 #include "r3d_moe_tab.h"
+#include "r3d_chain.h"
 
 namespace {
 
@@ -632,13 +633,14 @@ __device__ __forceinline__ float readlane_f(float v, int l)
     return __int_as_float(__builtin_amdgcn_readlane(__float_as_int(v), l));
 }
 
-template <int WG, int CS>
+template <int WG, int CS, class CH = HaloUnchained>
 __global__ __launch_bounds__(kThreads) void moe_w4a8_e4m3_gemv_kernel(
     const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
     uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
     int n_expert, int top_k, int a_sorted, int a_rows)
 {
+    R3D_CHAIN_SCOPE(CH);   /* the `e < 0` return is the whole block's (every wave ranks alike) */
     constexpr int TPL = kGroup / WG;     // weight groups (scale folds) a lane's block holds
     R3D_DYN_LDS(uint32_t, s_act);        // kGvRows rows x K/2 dwords of f16 pairs
     __shared__ float s_sa[kGvRows][32];  // a_scale of the rows, K/128 <= 32
@@ -803,13 +805,14 @@ namespace {
 constexpr int kLsThreads = 128;                 // four waves
 constexpr int kLsCols = 32;                     // columns a wave (8: 89.4, 16: 92.4, 64: 90.5 tok/s; 32: 92.9)
 
-template <int WG, int NCH>
+template <int WG, int NCH, class CH = HaloUnchained>
 __global__ __launch_bounds__(kLsThreads) void moe_w4a8_e4m3_gemv_ls_kernel(
     const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
     const int32_t* __restrict__ sorted, const int32_t* __restrict__ off, R3dMoeTabs tw,
     uint16_t* __restrict__ y, int T, int N, int K, int a_ld, int as_ld, int y_ld,
     int n_expert, int top_k, int a_sorted, int a_rows)
 {
+    R3D_CHAIN_SCOPE(CH);   /* returns are the whole block's; no barrier */
     typedef _Float16 h2 __attribute__((ext_vector_type(2)));
     const uint32_t tid = threadIdx.x, lane = tid & (kWave - 1), wave = tid / kWave;
 
@@ -959,6 +962,8 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
                          (unsigned)(c.T < c.n_expert ? c.T : c.n_expert));
         const size_t lds = (size_t)kGvRows * c.K * 2;
         const uint8_t* pa8 = (const uint8_t*)r3d_p(c.a);
+        /* the chained form where the row resolved with `chain` (r3d_chain.h), at decode */
+        const bool chain = r3d_chain_rows(a, c.T, 64);
         /* The lane-split form at the two widths it is instantiated for (the 26B-A4B's gate_up and
          * down), weight group 128: gate_up 37.8 -> 31.1 us, down 24.9 -> 21.2 a launch (cold
          * routings, RX 7900 XT); the 26B-A4B's decode 87.8 -> 91.8 tok/s. Elsewhere the
@@ -978,26 +983,25 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
             const dim3 lgrid((unsigned)((c.N + (kLsThreads / kWave) * kLsCols - 1) /
                                         ((kLsThreads / kWave) * kLsCols)),
                              (unsigned)(c.T < c.n_expert ? c.T : c.n_expert));
-#define R3D_LS1(WGV, NCHV)                                                                       \
-    R3D_KLAUNCH((moe_w4a8_e4m3_gemv_ls_kernel<WGV, NCHV>), lgrid, dim3(kLsThreads),              \
+#define R3D_LS1(WGV, NCHV, CHV)                                                                  \
+    R3D_KLAUNCH((moe_w4a8_e4m3_gemv_ls_kernel<WGV, NCHV, CHV>), lgrid, dim3(kLsThreads),         \
                 (hipStream_t)s, pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld,    \
                 as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar)
-#define R3D_LS(NCHV)                                                                             \
-    R3D_LS1(128, NCHV)
-            if (c.K == 2816) R3D_LS(11);
-            else             R3D_LS(3);
+#define R3D_LS(NCHV, CHV)                                                                        \
+    R3D_LS1(128, NCHV, CHV)
+            if (c.K == 2816) { if (chain) R3D_LS(11, r4dchain); else R3D_LS(11, HaloUnchained); }
+            else             { if (chain) R3D_LS(3, r4dchain);  else R3D_LS(3, HaloUnchained); }
 #undef R3D_LS
 #undef R3D_LS1
             return (int)hipGetLastError();
         }
-        if (wg == 32)
-            R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<32, kGvCS>), vgrid, dim3(kThreads), lds, (hipStream_t)s,
-                          pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,
-                          (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar);
-        else
-            R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<128, kGvCS>), vgrid, dim3(kThreads), lds, (hipStream_t)s,
-                          pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld, as_ld, y_ld,
-                          (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar);
+#define R3D_GV(WGV, CHV)                                                                         \
+    R3D_KLAUNCH_S((moe_w4a8_e4m3_gemv_kernel<WGV, kGvCS, CHV>), vgrid, dim3(kThreads), lds,      \
+                  (hipStream_t)s, pa8, psa, ps, po, tw, py, (int)c.T, (int)c.N, (int)c.K, a_ld,  \
+                  as_ld, y_ld, (int)c.n_expert, (int)c.top_k, c.a_sorted, (int)ar)
+        if (wg == 32) { if (chain) R3D_GV(32, r4dchain); else R3D_GV(32, HaloUnchained); }
+        else          { if (chain) R3D_GV(128, r4dchain); else R3D_GV(128, HaloUnchained); }
+#undef R3D_GV
         return (int)hipGetLastError();
     }
     /* Above the GEMV's 32 rows an E4M3 activation takes the run-aligned prefill tile (faster than

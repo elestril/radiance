@@ -1,8 +1,9 @@
 /* Ported from libhalo/halo_chain.h with the halo_ -> r3dh_ rename (identifiers only), so
  * libr3d serves the op on every gfx11 card. libhalo targets gfx1151, the same wave32 16x16x16
- * WMMA family as gfx1100. One thing differs from libhalo's file, marked `libr3d:`: on gfx10 and
- * gfx11 the acquire behind the wait (r3dh_chain_acquire) empties the GL1 from the scalar path
- * (s_gl1_inv) ahead of the scalar data cache. */
+ * WMMA family as gfx1100. Two things differ from libhalo's file, each marked `libr3d:`: on gfx10
+ * and gfx11 the acquire behind the wait (r3dh_chain_acquire) empties the GL1 from the scalar path
+ * (s_gl1_inv) ahead of the scalar data cache, and the wait's polling period depends on the grid
+ * size, as libr4d's does (R3DH_CHAIN_TINY, R3DH_CHAIN_SMALL, R3DH_CHAIN_MID). */
 /* Derived from libr4d/r4d_chain.h by the libhalo rename transform (2026-10-26);
  * see libhalo/README.md. Op schemas, row names and stored weight layouts are
  * shared with libr4d by design. Everything else in this file is libhalo's own
@@ -101,6 +102,15 @@ __device__ __forceinline__ const HaloChainRec* r3dh_chain_rec() {
 #ifndef R3DH_CHAIN_SLOW
 #define R3DH_CHAIN_SLOW 16
 #endif
+#ifndef R3DH_CHAIN_TINY
+#define R3DH_CHAIN_TINY 16
+#endif
+#ifndef R3DH_CHAIN_SMALL
+#define R3DH_CHAIN_SMALL 64
+#endif
+#ifndef R3DH_CHAIN_MID
+#define R3DH_CHAIN_MID 4
+#endif
 // The acquire behind a chained wait: the vector caches by the fence, the scalar data cache by
 // hand, which the fence leaves (see the head of this file). Every wave, for the compute unit it
 // runs on.
@@ -124,11 +134,19 @@ __device__ __forceinline__ void r3dh_chain_wait() {
     if (threadIdx.x == 0 && threadIdx.y == 0 && threadIdx.z == 0) {
         const unsigned long long target = r->target;
         unsigned long long* ctr = r->ctr;
+        /* libr3d: libr4d's period by grid size (r4d_chain.h): a grid of up to R3DH_CHAIN_TINY
+         * blocks keeps the fast period for the whole wait, up to R3DH_CHAIN_SMALL polls every
+         * R3DH_CHAIN_MID x 64 clocks. A decode step is mostly such grids behind one another. */
+        const unsigned nblk = gridDim.x * gridDim.y * gridDim.z;
         int n = 0;
         while (__hip_atomic_load(ctr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) < target) {
             if (n < R3DH_CHAIN_FAST) {
                 __builtin_amdgcn_s_sleep(1);
                 ++n;
+            } else if (nblk <= R3DH_CHAIN_TINY) {
+                __builtin_amdgcn_s_sleep(1);
+            } else if (nblk <= R3DH_CHAIN_SMALL) {
+                __builtin_amdgcn_s_sleep(R3DH_CHAIN_MID);
             } else {
                 __builtin_amdgcn_s_sleep(R3DH_CHAIN_SLOW);
             }

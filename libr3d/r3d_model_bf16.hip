@@ -45,6 +45,7 @@
 
 #include "r3d.h"
 #include "r3d_args.h"
+#include "r3d_chain.h"
 #include "r3d_common.h"
 #include "r3d_launch.h"
 #include "rad_yarn.h"
@@ -219,10 +220,11 @@ __device__ __forceinline__ float act_of(float x) {
  * `mult` scales the normed row before its one rounding, for a residual branch weighted by a
  * constant (e.g. 0.5 in Gemma 4's audio feed-forward); 1 leaves the product unchanged.
  */
-template <int THR, int WDT, int F32>
+template <int THR, int WDT, int F32, class CH = HaloUnchained>
 __global__ __launch_bounds__(THR) void rmsnorm_kernel(
     const uint16_t* __restrict__ x, const void* __restrict__ w, uint16_t* __restrict__ y,
     uint32_t n, float eps, float wadd, float mult, uint32_t x_ld, uint32_t y_ld, int pair) {
+    R3D_CHAIN_SCOPE(CH);   /* no return before the end */
     typedef typename std::conditional<F32 != 0, float, uint16_t>::type T;
     __shared__ float lds[THR / kWave];
     const uint32_t m = blockIdx.x;
@@ -664,11 +666,12 @@ __global__ __launch_bounds__(THR) void fill_kernel(void* __restrict__ y, uint32_
  * (i, i + head_dim/2), measures the ladder in head_dim, and keeps nfreq at rotary_dim/2; a pair
  * past nfreq turns by 0 (cos 1, sin 0) and is stored back exactly, as ref zeroes inv[] there.
  */
-template <int THR, int GPTJ>
+template <int THR, int GPTJ, class CH = HaloUnchained>
 __global__ __launch_bounds__(THR) void rope_kernel(
     uint16_t* __restrict__ qkv, const int32_t* __restrict__ pos, uint32_t head_dim,
     uint32_t n_rope_heads, uint32_t rot, uint32_t den, uint32_t nfreq, float theta, float scale,
     uint32_t row_pitch, RadYarn yarn) {
+    R3D_CHAIN_SCOPE(CH);   /* no return before the end */
     const uint32_t m = blockIdx.x;
     const float div = scale != 0.0f ? scale : 1.0f;
     const float p = (float)ldg_i32(pos + m) / div;
@@ -770,11 +773,12 @@ __global__ __launch_bounds__(THR) void kv_store_kernel(
  * over the whole table while the gather sees one row). `mult` is Gemma's sqrt(hidden), applied
  * after the scale, so with wscale 1 the product is ref's single rounding.
  */
-template <int THR>
+template <int THR, class CH = HaloUnchained>
 __global__ __launch_bounds__(THR) void embed_lookup_kernel(
     const int32_t* __restrict__ ids, const void* __restrict__ wte, void* __restrict__ x,
     uint32_t n_embd, int32_t n_vocab, int32_t vocab_off, float wscale, float mult, uint32_t x_ld,
     int64_t w_ld, int dt, int pair) {
+    R3D_CHAIN_SCOPE(CH);   /* the padding return is the whole block's; no barrier */
     const uint32_t m = blockIdx.x;
     const int32_t id = ldg_i32(ids + m) - vocab_off;
     char* __restrict__ xr = (char*)x + (size_t)m * x_ld * (size_t)dt_bytes(dt);
@@ -809,10 +813,11 @@ __global__ __launch_bounds__(THR) void embed_lookup_kernel(
  * (RAD_OPD_F_IDX_UNIQUE in the schema): two rows landing on one destination have no defined
  * winner, so the oracle and the kernel could disagree.
  */
-template <int THR>
+template <int THR, class CH = HaloUnchained>
 __global__ __launch_bounds__(THR) void gather_rows_kernel(
     const void* __restrict__ x, const int32_t* __restrict__ idx, void* __restrict__ y, uint32_t n,
     uint32_t x_ld, uint32_t y_ld, int dt, int32_t es, int64_t src_rows) {
+    R3D_CHAIN_SCOPE(CH);   /* the padding return is the whole block's; no barrier */
     const uint32_t m = blockIdx.x;
     const int32_t r = ldg_i32(idx + m);
     char* __restrict__ yr = (char*)y + (size_t)m * y_ld * (size_t)es;
@@ -882,8 +887,20 @@ static inline int row_pair(long base, int n, int ld1, int ld2) {
     } while (0)
 
 #define R3D_ROPE_K(THR, GPTJ, grid, stream, ...)                                                \
-    R3D_KLAUNCH(R3D_KNAME(rope_kernel<THR, GPTJ>), dim3((uint32_t)(grid)), dim3(THR),           \
-                (hipStream_t)(uintptr_t)(stream), __VA_ARGS__)
+    R3D_CHAIN_LAUNCH(rope_kernel, (THR, GPTJ,), dim3((uint32_t)(grid)), dim3(THR),              \
+                     (hipStream_t)(uintptr_t)(stream), __VA_ARGS__)
+
+/* R3D_ROW2 with the chained form where the entry's flag is set (r3d_chain.h): the kernel's
+ * template takes the tag after the thread count. */
+#define R3D_ROW2C(kernel, thr, grid, stream, ...)                                               \
+    do {                                                                                        \
+        if ((thr) == (int)kNarrow)                                                             \
+            R3D_CHAIN_LAUNCH(kernel, (kNarrow,), dim3((uint32_t)(grid)), dim3(kNarrow),        \
+                             (hipStream_t)(uintptr_t)(stream), __VA_ARGS__);                    \
+        else                                                                                    \
+            R3D_CHAIN_LAUNCH(kernel, (kThreads,), dim3((uint32_t)(grid)), dim3(kThreads),      \
+                             (hipStream_t)(uintptr_t)(stream), __VA_ARGS__);                    \
+    } while (0)
 
 /* A row count a dim3 can carry and a grid-strided loop cannot be asked to exceed. */
 static inline int row_count_ok(long long M) { return M > 0 && M <= 0x7fffffffLL; }
@@ -902,9 +919,9 @@ static int rmsnorm_launch(long x, long w, long y, int M, int n, float eps, float
     uint16_t* yp = (uint16_t*)(uintptr_t)y;
     const void* wp = (const void*)(uintptr_t)w;
 #define R3D_RMS(THR, WDT)                                                                       \
-    R3D_KLAUNCH(R3D_KNAME(rmsnorm_kernel<THR, WDT, 0>), dim3((uint32_t)M), dim3(THR),           \
-                (hipStream_t)(uintptr_t)stream, xp, wp, yp, (uint32_t)n, eps, wadd, mult,       \
-                (uint32_t)x_ld, (uint32_t)y_ld, pair)
+    R3D_CHAIN_LAUNCH(rmsnorm_kernel, (THR, WDT, 0,), dim3((uint32_t)M), dim3(THR),              \
+                     (hipStream_t)(uintptr_t)stream, xp, wp, yp, (uint32_t)n, eps, wadd, mult,  \
+                     (uint32_t)x_ld, (uint32_t)y_ld, pair)
     if (wdt == R3D_DT_F32) {
         if (thr == (int)kNarrow) R3D_RMS(kNarrow, R3D_DT_F32); else R3D_RMS(kThreads, R3D_DT_F32);
     } else if (wdt == R3D_DT_BF16) {
@@ -1344,7 +1361,7 @@ extern "C" int r3d_embed_lookup(long ids, long wte, long x, int M, int n_embd, i
     if (x_ld < n_embd || w_ld < n_embd) return -3;
     const int thr = row_threads(n_embd);
     const int pair = (dt == R3D_DT_BF16) ? row_pair(x, n_embd, x_ld, x_ld) : 0;
-    R3D_ROW2(embed_lookup_kernel, thr, M, stream, (const int32_t*)(uintptr_t)ids,
+    R3D_ROW2C(embed_lookup_kernel, thr, M, stream, (const int32_t*)(uintptr_t)ids,
              (const void*)(uintptr_t)wte, (void*)(uintptr_t)x, (uint32_t)n_embd, (int32_t)n_vocab,
              (int32_t)vocab_offset, wscale, mult, (uint32_t)x_ld, (int64_t)w_ld, dt, pair);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -1361,7 +1378,7 @@ extern "C" int r3d_gather_rows(long x, long idx, long y, int M, int n, int x_ld,
     if (!x_ld) x_ld = n;
     if (!y_ld) y_ld = n;
     if (x_ld < n || y_ld < n) return -3;
-    R3D_ROW2(gather_rows_kernel, row_threads(n), M, stream, (const void*)(uintptr_t)x,
+    R3D_ROW2C(gather_rows_kernel, row_threads(n), M, stream, (const void*)(uintptr_t)x,
              (const int32_t*)(uintptr_t)idx, (void*)(uintptr_t)y, (uint32_t)n, (uint32_t)x_ld,
              (uint32_t)y_ld, dt, es, (int64_t)src_rows);
     return hipGetLastError() == hipSuccess ? 0 : -4;
@@ -1420,6 +1437,7 @@ static inline int r3d_launch_ok(int rc) { return rc == 0 ? RAD_OK : R3D_NO(RAD_E
 enum { RMS_X = 0, RMS_W, RMS_Y };
 
 extern "C" int r3d_rad_rmsnorm(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* x = r3d_opt(a, RMS_X);
     const RadTensor* w = r3d_opt(a, RMS_W);
     const RadTensor* y = r3d_opt(a, RMS_Y);
@@ -1847,6 +1865,7 @@ extern "C" int r3d_rad_fill(const RadArgs* a, RadStream s) {
  * head.
  */
 extern "C" int r3d_rad_rope(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* qkv = r3d_opt(a, 0);
     const RadTensor* pos = r3d_opt(a, 1);
     if (!qkv || !pos) return R3D_NO(RAD_E_INVAL);
@@ -2000,6 +2019,7 @@ extern "C" int r3d_rad_kv_store(const RadArgs* a, RadStream s) {
  * (embed_lookup_q's operand): a per-row scale read is a device read the step path cannot do, which
  * is why the op's schema carries `wscale` as a parameter. */
 extern "C" int r3d_rad_embed_lookup(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* tok = r3d_opt(a, 0);
     const RadTensor* wte = r3d_opt(a, 1);
     const RadTensor* x = r3d_opt(a, 2);
@@ -2037,6 +2057,7 @@ extern "C" int r3d_rad_embed_lookup(const RadArgs* a, RadStream s) {
 /* ------------------------------------------------------------------ gather_rows / scatter_rows */
 
 extern "C" int r3d_rad_gather_rows(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* x = r3d_opt(a, 0);
     const RadTensor* idx = r3d_opt(a, 1);
     const RadTensor* y = r3d_opt(a, 2);

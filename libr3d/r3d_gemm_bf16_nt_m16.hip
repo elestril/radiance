@@ -78,6 +78,7 @@
 #include "r3d.h"
 #include "r3d_common.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 
 #include <algorithm>
 
@@ -337,6 +338,7 @@ extern "C" int r3d_rad_gemm_nt_bf16_m16(const RadArgs* a, RadStream s)
     R3dGemmCfg c;
     r3d_cfg_gemm(a, &c);
     if (c.impl == 1) {
+        HaloChainScope chain_(r3d_chain_rows(a, M));   /* the arm's chained form (r3d_chain.h) */
         /* The wave-matrix arm: same contract, the slab's law at 16 k, its own launcher. The
          * alignment and pitch checks above are the arm's too. `c.sk` is the unresolved value
          * here -- the arm resolves 0 to its widest legal split and checks its own scratch, so

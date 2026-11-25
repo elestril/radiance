@@ -131,6 +131,7 @@
 #include "r3d_tiling.h"          /* LDS tile addressing: srow, srow_pair */
 #include "r3d_args.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 
 #include "rad_planes.h"
 
@@ -503,11 +504,12 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
  * barrier) and each lane streams its vocabulary row 128 bytes at a time, eight 16-byte loads
  * ahead of their dot2. The dot2 chain, the widenings and the store are the decode arm's, in the
  * same ascending k, so the output is the same bytes. */
-template <bool YF32, int NT>
+template <bool YF32, int NT, class CH = HaloUnchained>
 __global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(4)
 logits_row1_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
                    void* __restrict__ y, int N, int K)
 {
+    R3D_CHAIN_SCOPE(CH);   /* a lane's return is past the staging barrier, the body's only one */
     R3D_DYN_LDS(uint32_t, sX);          /* K f16, in k order: dword j holds k = 2j, 2j+1 */
     for (int j = (int)threadIdx.x; j < K / 8; j += kBlockThreads)
         *(uint4*)&sX[4 * j] = widen8(*(const uint4*)(x + 8 * j));
@@ -592,8 +594,14 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
     if (M == 1 && !wq && (long long)K * 2 <= 48 * 1024) {
         const dim3 grid((unsigned)((N + kBlockThreads - 1) / kBlockThreads)), block(kBlockThreads);
         const size_t lds = (size_t)K * 2;
-        if (nt) R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 1>)), grid, block, lds, s, x, w, y, N, K);
-        else    R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 0>)), grid, block, lds, s, x, w, y, N, K);
+        /* the chained form where the entry's flag is set (r3d_chain.h) */
+        if (r3dh_chain_flag()) {
+            if (nt) R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 1, r4dchain>)), grid, block, lds, s, x, w, y, N, K);
+            else    R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 0, r4dchain>)), grid, block, lds, s, x, w, y, N, K);
+        } else {
+            if (nt) R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 1>)), grid, block, lds, s, x, w, y, N, K);
+            else    R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 0>)), grid, block, lds, s, x, w, y, N, K);
+        }
         return hipGetLastError() == hipSuccess ? 0 : -4;
     }
     if (M <= kSkinnyMax) {
@@ -800,6 +808,7 @@ extern "C" int r3d_rad_gemm_nt_bf16_m64_wmma(const RadArgs*, RadStream);
  * 16-column-tile kernel) run through their own shims, which stay as entry points. */
 extern "C" int r3d_rad_logits_gemm_bf16(const RadArgs* a, RadStream s)
 {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the one-row arm's chained form at decode */
     R3dGemmCfg c;
     r3d_cfg_gemm(a, &c);
     return r3d_logits_gemm_bf16_dispatch(a, s, c.impl);

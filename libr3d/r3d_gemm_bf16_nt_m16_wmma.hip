@@ -63,6 +63,7 @@
 #include "r3d.h"
 #include "r3d_common.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 
 #include <algorithm>
 
@@ -91,12 +92,13 @@ __device__ __forceinline__ r3d_u32x4 ldw(const uint16_t* p)
  * `kslab` is the k range a blockIdx.y owns; with sk = 1 it is all of K and the store is the
  * narrowed bf16 the caller asked for. With sk > 1 every split writes its own f32 partial,
  * dense [sk][M][N], and the reducer adds them in split order. */
-template <bool NT, bool SPLIT>
+template <bool NT, bool SPLIT, class CH = HaloUnchained>
 __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(5) void gemm_m16_wmma_kernel(
     const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
     uint16_t* __restrict__ Y, float* __restrict__ Part,
     int M, int N, int K, int a_ld, int y_ld, int w_ld, int kslab)
 {
+    R3D_CHAIN_SCOPE(CH);   /* the store's return is a lane's, past everything; no barrier */
     const uint32_t tid  = threadIdx.x;
     const uint32_t lane = tid & (kWave - 1);
     const uint32_t wave = tid / kWave;
@@ -174,9 +176,11 @@ __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(5) void gemm_m16_wmma_kern
 /* The split reduction: v = ((p0 + p1) + p2) + ... in ascending split order, then one
  * narrowing. The dot2 arm's, copied: the slab sums bracket the products differently than
  * one chain does, and the difference is in the last bits, the split's, not a bug in it. */
+template <class CH = HaloUnchained>
 __global__ __launch_bounds__(kBlockThreads) R3D_WAVES(8) void gemm_m16_wmma_split_reduce(
     const float* __restrict__ Part, uint16_t* __restrict__ Y, int M, int N, int y_ld, int sk)
 {
+    R3D_CHAIN_SCOPE(CH);
     const int mn = M * N;
     const int stride = gridDim.x * kBlockThreads;
     for (int i = blockIdx.x * kBlockThreads + threadIdx.x; i < mn; i += stride) {
@@ -226,18 +230,18 @@ extern "C" int r3d_gemm_nt_bf16_m16_wmma(long a, long b, long y, int M, int N, i
         const int nt_ = (N + 15) / 16;                                                          \
         const dim3 grid((nt_ + wv - 1) / wv, (unsigned)sk), block((unsigned)(wv * kWave));      \
         if (sk > 1) {                                                                           \
-            R3D_KLAUNCH(R3D_KNAME((gemm_m16_wmma_kernel<NTV, true>)), grid, block,              \
-                        (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)b,           \
-                        (uint16_t*)y, (float*)scratch, M, N, K, a_ld, y_ld, K, kslab);          \
+            R3D_CHAIN_LAUNCH(gemm_m16_wmma_kernel, (NTV, true,), grid, block,                   \
+                             (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)b,      \
+                             (uint16_t*)y, (float*)scratch, M, N, K, a_ld, y_ld, K, kslab);     \
             const int mn = M * N;                                                               \
             const int nb = std::min((mn + kBlockThreads - 1) / kBlockThreads, 4096);            \
-            R3D_KLAUNCH(gemm_m16_wmma_split_reduce, dim3(nb), dim3(kBlockThreads),              \
-                        (hipStream_t)stream, (const float*)scratch, (uint16_t*)y, M, N, y_ld,   \
-                        sk);                                                                    \
+            R3D_CHAIN_LAUNCH(gemm_m16_wmma_split_reduce, (), dim3(nb), dim3(kBlockThreads),     \
+                             (hipStream_t)stream, (const float*)scratch, (uint16_t*)y, M, N,   \
+                             y_ld, sk);                                                         \
         } else {                                                                                \
-            R3D_KLAUNCH(R3D_KNAME((gemm_m16_wmma_kernel<NTV, false>)), grid, block,             \
-                        (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)b,           \
-                        (uint16_t*)y, (float*)nullptr, M, N, K, a_ld, y_ld, K, kslab);          \
+            R3D_CHAIN_LAUNCH(gemm_m16_wmma_kernel, (NTV, false,), grid, block,                  \
+                             (hipStream_t)stream, (const uint16_t*)a, (const uint16_t*)b,      \
+                             (uint16_t*)y, (float*)nullptr, M, N, K, a_ld, y_ld, K, kslab);     \
         }                                                                                       \
     } while (0)
     if (nt) R3D_WNT(true);

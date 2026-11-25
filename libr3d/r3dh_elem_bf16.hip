@@ -2,8 +2,8 @@
  * (libhalo/halo_model_bf16.hip), taken out of that unit with the halo_ -> r3dh_ rename. The rest
  * of halo_model_bf16.hip duplicates ops libr3d already serves (r3d_model_bf16.hip), so only these
  * five came over.
- * The chained forms are left out: libr3d builds no chained form (README, "No collective rows and
- * no chained forms").
+ * libhalo's chained forms are left out; logit_softcap has libr3d's own (r3d_chain.h, marked
+ * `libr3d:`).
  *
  *   mul_weight     y = x * w, w one element (a scalar for the whole op) or one row of n
  *                  broadcast down the rows; bf16 x and y, a bf16 or f32 w, the f32 product rounded
@@ -21,6 +21,7 @@
  */
 #include "r3dh_args.h"
 #include "r3dh_common.h"
+#include "r3d_chain.h"   /* libr3d: the soft-cap's chained form */
 
 #include <algorithm>
 #include <cmath>
@@ -47,10 +48,11 @@ __global__ __launch_bounds__(kThreads) void mul_weight_kernel(
 }
 
 /* ref_logit_softcap, both legs: the bf16 one rounds the result once, the f32 one not at all. */
-template <typename T>
+template <typename T, class CH = HaloUnchained>
 __global__ __launch_bounds__(kThreads) void logit_softcap_kernel(
     const T* __restrict__ x, T* __restrict__ y, uint32_t n, float cap, uint32_t x_ld,
     uint32_t y_ld) {
+    R3D_CHAIN_SCOPE(CH);   /* libr3d: the chained form's bracket; no return, no barrier */
     const uint32_t m = blockIdx.x;
     const T* __restrict__ xr = x + (size_t)m * x_ld;
     T* __restrict__ yr = y + (size_t)m * y_ld;
@@ -139,6 +141,7 @@ extern "C" int r3dh_rad_mul_weight(const RadArgs* a, RadStream s) {
 }
 
 extern "C" int r3dh_rad_logit_softcap(const RadArgs* a, RadStream s) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* libr3d: the chained form at decode heights */
     const RadTensor* x = r3dh_opt(a, 0);
     const RadTensor* y = r3dh_opt(a, 1);
     if (!x || !y) return R3DH_NO(RAD_E_INVAL);
@@ -157,13 +160,13 @@ extern "C" int r3dh_rad_logit_softcap(const RadArgs* a, RadStream s) {
     if (M <= 0 || My < M || M > 0x7fffffff) return R3DH_NO(RAD_E_SHAPE);
     const dim3 grid((uint32_t)M, softcap_blocks_per_row(n));
     if (leg_bf16)
-        hipLaunchKernelGGL(logit_softcap_kernel<uint16_t>, grid, dim3(kThreads), 0,
-                           (hipStream_t)s, (const uint16_t*)x->data, (uint16_t*)y->data,
-                           (uint32_t)n, cap, (uint32_t)x_ld, (uint32_t)y_ld);
+        R3D_CHAIN_LAUNCH(logit_softcap_kernel, (uint16_t,), grid, dim3(kThreads), (hipStream_t)s,
+                         (const uint16_t*)x->data, (uint16_t*)y->data, (uint32_t)n, cap,
+                         (uint32_t)x_ld, (uint32_t)y_ld);
     else
-        hipLaunchKernelGGL(logit_softcap_kernel<float>, grid, dim3(kThreads), 0, (hipStream_t)s,
-                           (const float*)x->data, (float*)y->data, (uint32_t)n, cap,
-                           (uint32_t)x_ld, (uint32_t)y_ld);
+        R3D_CHAIN_LAUNCH(logit_softcap_kernel, (float,), grid, dim3(kThreads), (hipStream_t)s,
+                         (const float*)x->data, (float*)y->data, (uint32_t)n, cap,
+                         (uint32_t)x_ld, (uint32_t)y_ld);
     return hipGetLastError() == hipSuccess ? RAD_OK : RAD_E_DEVICE;
 }
 

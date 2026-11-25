@@ -32,6 +32,7 @@
 #include "r3d_args.h"
 #include "r3d_common.h"
 #include "r3d_launch.h"
+#include "r3d_chain.h"
 
 namespace {
 
@@ -125,10 +126,11 @@ __device__ __forceinline__ float block_max(float v, float* lds) {
  * Rows are dim 0, so a rank-3 activation ([tokens, heads, width], a GDN block's out-projection
  * input) is one row per token, as libref reads it: the consuming GEMM's K is heads*width.
  */
-template <int GROUP>
+template <int GROUP, class CH = HaloUnchained>
 __global__ __launch_bounds__(kThreads) R3D_WAVES(8) void quant_act_fp8_kernel(
     const uint16_t* __restrict__ x, uint8_t* __restrict__ q, float* __restrict__ s, uint32_t n,
     uint32_t ngrp, uint32_t x_ld, uint32_t s_ld) {
+    R3D_CHAIN_SCOPE(CH);   /* no return and no barrier in the body */
     constexpr int kSub   = GROUP >= (int)kWaveCols ? GROUP / (int)kWaveCols : 1;
     constexpr int kPer   = GROUP < (int)kWaveCols ? (int)kWaveCols / GROUP : 1;
     constexpr int kLanes = GROUP < (int)kWaveCols ? (int)(GROUP / kColsPerLane) : (int)kWave;
@@ -256,9 +258,9 @@ extern "C" int r3d_quant_act_fp8(long x, long q, long s, int M, int n, int group
     const hipStream_t st = (hipStream_t)(uintptr_t)stream;
     const dim3 grid((unsigned)M), block(kThreads);
 #define R3D_QAF(G)                                                                                  \
-    R3D_KLAUNCH(R3D_KNAME(quant_act_fp8_kernel<G>), grid, block, st, (const uint16_t*)x,            \
-                (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)ngrp, (uint32_t)x_ld,                \
-                (uint32_t)s_ld)
+    R3D_CHAIN_LAUNCH(quant_act_fp8_kernel, (G,), grid, block, st, (const uint16_t*)x,               \
+                     (uint8_t*)q, (float*)s, (uint32_t)n, (uint32_t)ngrp, (uint32_t)x_ld,           \
+                     (uint32_t)s_ld)
     switch (group) {
         case 4:   R3D_QAF(4);   break;
         case 8:   R3D_QAF(8);   break;
@@ -660,6 +662,7 @@ static inline int r3d_group_of(long long g, long long n) {
 enum { QAF_X = 0, QAF_Q, QAF_S };
 
 extern "C" int r3d_rad_quant_act_fp8(const RadArgs* a, RadStream stream) {
+    HaloChainScope chain_(r3dh_chain_small(a));   /* the chained form at decode heights */
     const RadTensor* x  = r3d_opt(a, QAF_X);
     const RadTensor* q  = r3d_opt(a, QAF_Q);
     const RadTensor* sc = r3d_opt(a, QAF_S);
