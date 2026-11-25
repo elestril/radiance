@@ -3061,6 +3061,101 @@ static void check_moe_numerics() {
 #endif
 }
 
+/* ================================================================== moe_gather, by value
+ *
+ * y[t] = the sum over the token's slots j of expert_w[t, j] * y_expert[row(t, j)], the slots in
+ * ascending order, in f32 with one bf16 store; row(t, j) is the sorted row whose sorted_tok entry
+ * is t * top_k + j, and a dropped slot has none and adds nothing. With the shared arm (act "none")
+ * the gate times the shared row is rounded to bf16 and the sum of the two bf16 is stored. The host
+ * mirror runs that order and the device's output is compared bit for bit.
+ *
+ * A band's M is the step's ceiling: a decode step issues a y of fewer rows and a slot table for
+ * those tokens alone, and the launch covers y's rows. The plane behind y is two rows longer than
+ * the view here, and those rows must keep their bytes.
+ */
+static void check_moe_gather_numerics() {
+    std::printf("== moe_gather, by value\n");
+#ifndef RAD_HAVE_HIP
+    skip("built without HIP: moe_gather is not run");
+#else
+    using namespace moenum;
+    auto fn = (Launch)dlsym(g_h, "r3d_rad_moe_gather");
+    if (!fn) { fail("r3d_rad_moe_gather is missing"); return; }
+    int ndev = 0;
+    if (hipGetDeviceCount(&ndev) != hipSuccess || ndev == 0) { skip("no device visible"); return; }
+    /* The band's M, y's rows, and whether the shared arm is bound. */
+    static const struct { long long M, rows; bool shared; } kCase[] = {
+        { 8, 8, false }, { 2048, 1, false }, { 64, 5, true },
+    };
+    const long long TK = 8, NE = 12, n = 704;
+    const uint16_t kCanary = 0x7f95;
+    for (const auto& gc : kCase) {
+        const long long M = gc.M, R = gc.rows;
+        uint32_t st = 0x6A7Du + (uint32_t)(M * 31 + R);
+        auto rndf = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return ((st >> 8) & 0xffffu) / 65536.0f - 0.5f;
+        };
+        char what[96];
+        std::snprintf(what, sizeof(what), "moe_gather, M %lld, y of %lld rows, top_k 8, n 704%s", M, R,
+                      gc.shared ? ", shared arm" : "");
+        const Route r = route(R, TK, NE, st);
+        const long long T = r.T;
+        /* inv[t * top_k + j]: the sorted row of slot j of token t, or -1 where it was dropped. */
+        std::vector<int32_t> inv((size_t)T, -1);
+        for (long long i = 0; i < T; ++i) if (r.sorted[i] >= 0) inv[(size_t)r.sorted[i]] = (int32_t)i;
+        std::vector<uint16_t> ye((size_t)(T * n)), ew((size_t)T), sh((size_t)(R * n)), sg((size_t)R);
+        for (auto& x : ye) x = f32_to_bf16(rndf() * 4.0f);
+        for (auto& x : ew) x = f32_to_bf16(rndf() + 0.5f);
+        for (auto& x : sh) x = f32_to_bf16(rndf() * 4.0f);
+        for (auto& x : sg) x = f32_to_bf16(rndf() * 2.0f);
+        std::vector<uint16_t> y0((size_t)((R + 2) * n), kCanary);
+        Dev dv;
+        RadTensor t[6] = { dense(dv.put(ye.data(), ye.size() * 2), RAD_BF16, T, n),
+                           dense(dv.put(ew.data(), ew.size() * 2), RAD_BF16, R, TK),
+                           vec(dv.put(r.sorted.data(), (size_t)T * 4), RAD_I32, T),
+                           RadTensor{}, RadTensor{},
+                           dense(dv.put(y0.data(), y0.size() * 2), RAD_BF16, R, n) };
+        if (gc.shared) {
+            t[3] = dense(dv.put(sh.data(), sh.size() * 2), RAD_BF16, R, n);
+            t[4] = vec(dv.put(sg.data(), sg.size() * 2), RAD_BF16, R);
+        }
+        std::vector<RadParam> p = { pi("M", M), pi("n", n), pi("top_k", TK), ps("dtype", "bf16") };
+        if (gc.shared) p.push_back(ps("act", "none"));
+        RadArgs a{ t, 6, p.data(), (int)p.size(), nullptr, 0, nullptr, 0, 1 };
+        const int rc = fn(&a, nullptr);
+        if (hipDeviceSynchronize() != hipSuccess) { fail("%s: the kernel faulted", what); continue; }
+        if (rc != 0) { fail("%s: the launch returned %d", what, rc); continue; }
+        std::vector<uint16_t> y(y0.size());
+        if (hipMemcpy(y.data(), t[5].data, y.size() * 2, hipMemcpyDeviceToHost) != hipSuccess) {
+            fail("%s: copying y back failed", what); continue; }
+        long long bad = 0, guard = 0;
+        for (long long tk = 0; tk < R; ++tk)
+            for (long long c = 0; c < n; ++c) {
+                float acc = 0.0f;
+                for (long long j = 0; j < TK; ++j) {
+                    const int32_t i = inv[(size_t)(tk * TK + j)];
+                    if (i < 0) continue;
+                    acc += bf16_to_f32(ew[(size_t)(tk * TK + j)]) * bf16_to_f32(ye[(size_t)(i * n + c)]);
+                }
+                uint16_t want = f32_to_bf16(acc);
+                if (gc.shared) {
+                    const uint16_t ps16 = f32_to_bf16(bf16_to_f32(sh[(size_t)(tk * n + c)]) *
+                                                      bf16_to_f32(sg[(size_t)tk]));
+                    want = f32_to_bf16(bf16_to_f32(ps16) + bf16_to_f32(want));
+                }
+                if (y[(size_t)(tk * n + c)] != want) ++bad;
+            }
+        for (long long i = R * n; i < (R + 2) * n; ++i) if (y[(size_t)i] != kCanary) ++guard;
+        if (bad || guard)
+            fail("%s: %lld of %lld outputs differ from the reference, %lld written past y's rows", what,
+                 bad, R * n, guard);
+        else
+            ok("%s: %lld outputs bit-identical to the reference, the rows past y untouched", what, R * n);
+    }
+#endif
+}
+
 /* ================================================================== causal_conv1d, by value
  *
  * LFM2's and LFM3's short convolution against a host mirror of libref/ref_ple.cpp's depthwise
@@ -3920,6 +4015,7 @@ int main(int argc, char** argv) {
         check_band_reach();
         check_shapes();
         check_moe_numerics();
+        check_moe_gather_numerics();
         check_conv_numerics();
         check_rope_numerics();
     check_attn_depth();
