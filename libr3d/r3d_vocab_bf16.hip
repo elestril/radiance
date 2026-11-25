@@ -39,8 +39,9 @@
  * The activation is staged in 128-k chunks in LDS (MT x 128 f16, 4 KiB at MT=16, same swizzle);
  * the weight goes from global to registers in 16-byte loads, eight values at a time.
  *
- * `nt=1` requests non-temporal head loads. On gfx1102 it measures within 1% of the default at M=1,
- * so it is off by default.
+ * `nt=1` requests non-temporal head loads. On gfx1102 it measures within 1% of the default at M=1;
+ * on an RX 7900 XT (gfx1100) the one-row arm's 1.48 GB bf16 head reads 4.6% faster with it in the
+ * 26B-A4B's decode pass (2190 -> 2089 us), so that arm takes it; the other arms keep the default.
  *
  * The quantised head is half the bytes of the bf16 one (255 MiB of codes plus 32 KiB of scales
  * against 510 MiB at the band), which is its case for decode.
@@ -495,6 +496,53 @@ logits_skinny_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict_
     }
 }
 
+/* ============================================================ the one-row arm, M = 1, bf16 head
+ *
+ * The decode arm at MT = 1 stages the activation a 128-k chunk at a time behind two barriers, so a
+ * lane has at most one chunk's loads in flight. Here the whole row is staged once (K f16, one
+ * barrier) and each lane streams its vocabulary row 128 bytes at a time, eight 16-byte loads
+ * ahead of their dot2. The dot2 chain, the widenings and the store are the decode arm's, in the
+ * same ascending k, so the output is the same bytes. */
+template <bool YF32, int NT>
+__global__ void __launch_bounds__(kBlockThreads) R3D_WAVES(4)
+logits_row1_kernel(const uint16_t* __restrict__ x, const uint16_t* __restrict__ w,
+                   void* __restrict__ y, int N, int K)
+{
+    R3D_DYN_LDS(uint32_t, sX);          /* K f16, in k order: dword j holds k = 2j, 2j+1 */
+    for (int j = (int)threadIdx.x; j < K / 8; j += kBlockThreads)
+        *(uint4*)&sX[4 * j] = widen8(*(const uint4*)(x + 8 * j));
+    __syncthreads();
+
+    const int n = (int)blockIdx.x * kBlockThreads + (int)threadIdx.x;
+    if (n >= N) return;
+    const uint16_t* wrow = w + (long long)n * K;
+    float acc = 0.0f;
+    int k = 0;
+    for (; k + 64 <= K; k += 64) {
+        uint4 wv[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) wv[u] = loadw8<NT>(wrow + k + 8 * u);
+#pragma unroll
+        for (int u = 0; u < 8; ++u) {
+            const uint4 xa = *(const uint4*)&sX[(k + 8 * u) / 2];
+            acc = dot2_f16x2(xa.x, bf16x2_to_f16x2(wv[u].x), acc);
+            acc = dot2_f16x2(xa.y, bf16x2_to_f16x2(wv[u].y), acc);
+            acc = dot2_f16x2(xa.z, bf16x2_to_f16x2(wv[u].z), acc);
+            acc = dot2_f16x2(xa.w, bf16x2_to_f16x2(wv[u].w), acc);
+        }
+    }
+    for (; k < K; k += 8) {
+        const uint4 wv = loadw8<NT>(wrow + k);
+        const uint4 xa = *(const uint4*)&sX[k / 2];
+        acc = dot2_f16x2(xa.x, bf16x2_to_f16x2(wv.x), acc);
+        acc = dot2_f16x2(xa.y, bf16x2_to_f16x2(wv.y), acc);
+        acc = dot2_f16x2(xa.z, bf16x2_to_f16x2(wv.z), acc);
+        acc = dot2_f16x2(xa.w, bf16x2_to_f16x2(wv.w), acc);
+    }
+    if (YF32) ((float*)y)[n] = acc;
+    else ((uint16_t*)y)[n] = f32_to_bf16(acc);
+}
+
 /* ------------------------------------------------------------------ the shared launcher
  *
  * Returns 0, -1 a null pointer, -2 a shape it does not serve, -3 a pitch it cannot read, -4 the HIP
@@ -541,6 +589,13 @@ int gemm_launch(long xv, long wv, long yv, int M, int N, int K, int x_ld, int y_
         if (((long long)(uintptr_t)h.codes & 7) || ((long long)(uintptr_t)h.scale & 3)) return -5;
     }
 
+    if (M == 1 && !wq && (long long)K * 2 <= 48 * 1024) {
+        const dim3 grid((unsigned)((N + kBlockThreads - 1) / kBlockThreads)), block(kBlockThreads);
+        const size_t lds = (size_t)K * 2;
+        if (nt) R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 1>)), grid, block, lds, s, x, w, y, N, K);
+        else    R3D_KLAUNCH_S(R3D_KNAME((logits_row1_kernel<YF32, 0>)), grid, block, lds, s, x, w, y, N, K);
+        return hipGetLastError() == hipSuccess ? 0 : -4;
+    }
     if (M <= kSkinnyMax) {
 #define R3D_SKINNY(MTV, NTV, WQV, ALUV)                                                                \
     do {                                                                                         \
@@ -673,9 +728,10 @@ int rad_gemm_run(const RadArgs* a, RadStream s, int y_is_f32, const char* nkey, 
     if (!r3d_aligned(r3d_p(x), 16) || !r3d_aligned(r3d_p(w), 16) || !r3d_aligned(r3d_p(y), 16))
         return R3D_NO(RAD_E_ALIGN);
 
-    /* No `sk`/`kb`/`nt` in the rows' tune tables (impl only): the grid is vocab-wide, KC = 32 and
-     * the non-temporal stream is off, see the header's refusals. */
-    const int sk = 1, kb = 0, nt = 0;
+    /* No `sk`/`kb`/`nt` in the rows' tune tables (impl only): the grid is vocab-wide, KC = 32,
+     * and the non-temporal stream is on for the one-row arm only (M = 1, a bf16 head; see the
+     * header). */
+    const int sk = 1, kb = 0, nt = (M == 1 && !joined) ? 1 : 0;
 
     const HeadQ* hp = joined ? &h : nullptr;
     const int e = y_is_f32
