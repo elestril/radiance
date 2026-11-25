@@ -19,8 +19,8 @@
  * scale_w[e][n][b] in f32 -- the exact order the libref reference runs, so the int8 arm agrees bit
  * for bit.
  *
- * Decode band: at most 16 sorted rows per block (M * top_k <= 16); prefill finds no row and falls
- * back. STATUS: the w4a8 form is served (both activation arms). Remaining: the codebook NL forms
+ * A 16-row block walks the expert runs in its rows; where the grid is small (decode) the runs are
+ * spread over grid.z, one block a run. STATUS: the w4a8 form is served (both activation arms). Remaining: the codebook NL forms
  * (w4nl64a8h / w4nl32a8h / w5nl64a8h, magnitude-table decode), a prefill path above 16 sorted rows,
  * and the SK/UW/RS tuning.
  */
@@ -108,7 +108,7 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_i8_kernel(
     const uint32_t nc = ncol + r;
     const int n_real = (int)(nc < (uint32_t)N ? nc : (uint32_t)N - 1);
 
-    for (int run = 0; run < nruns; ++run) {
+    for (int run = (int)blockIdx.z; run < nruns; run += (int)gridDim.z) {
         const int rs = s_rs[run], re = s_re[run], e = s_e[run];
         v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
         if (e >= 0) {
@@ -214,7 +214,7 @@ __global__ __launch_bounds__(WV * kWave) R3D_WAVES(WV) void moe_w4a8_e4m3_kernel
     const uint32_t nc = n0 + wave * 16 + r;   // this wave's output column
     const int n_real = (int)(nc < (uint32_t)N ? nc : (uint32_t)N - 1);
 
-    for (int run = 0; run < nruns; ++run) {
+    for (int run = (int)blockIdx.z; run < nruns; run += (int)gridDim.z) {
         const int rs = s_rs[run], re = s_re[run], e = s_e[run];
         v8float acc = v8float{ 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f };
         if (e >= 0) {
@@ -328,6 +328,11 @@ int r3d_rad_moe_gemm_w4a8(const RadArgs* a, RadStream s)
     const int wv = r3d_geti_or(a, "wv", 8);
     const int ctile = wv * 16;
     dim3 grid((unsigned)((c.N + ctile - 1) / ctile), (unsigned)((c.T + mrows - 1) / mrows)), blk(wv * kWave);
+    /* Few blocks (decode: one token's top_k rows are top_k runs of one row in one 16-row block):
+     * spread a block's runs over grid.z, block z taking runs z, z + gridDim.z, ... Each run is
+     * still one block's, accumulated in the same order, so the output is the same bytes; the
+     * blocks past a block's run count leave after the setup. */
+    if (grid.x * grid.y < 256u) grid.z = (unsigned)(c.T < mrows ? c.T : mrows);
     if (c.a->dtype == RAD_I8) {
         const int8_t* pa8 = (const int8_t*)r3d_p(c.a);
         if (mrows == 8 && wv == 4)

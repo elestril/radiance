@@ -346,7 +346,8 @@ bytes: decode-bound on the E4M3 widen, which is why that row's tile is 16 rows a
 the one the prefill geometry reaches for.
 
 `moe_gemm_w4a8` — the `moe_gemm_q` row at `dtype=w4a8`: int8 activation, packed two's-complement
-int4 experts. The same run-walk structure as the siblings, a 16x128 block (the eight waves do
+int4 experts. Where the grid is small (decode)
+a block's expert runs go over grid.z, one block a run. The same run-walk structure as the siblings, a 16x128 block (the eight waves do
 unique 16-column sub-tiles), the int8 activation and the packed int4 weight (decoded exactly to
 int8, the native i32 wave matrix) with the scales folded per 128 of K — an f32 a-scale and a bf16
 w-scale. The experts are two tables by parity (even `w`/`w_scale`, odd `w_odd`/`w_odd_scale`), as
