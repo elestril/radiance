@@ -40,8 +40,19 @@ __device__ __forceinline__ void rad_chain_wait() {
     /* The fence empties the vector caches. A load every lane shares may be a scalar one, and the
      * scalar data cache still holds what a launch read from the address before the launch in front
      * of this one wrote it: only the packet processor's acquire empties that cache, and it runs
-     * when the kernel is launched, before the launch in front has written. */
+     * when the kernel is launched, before the launch in front has written.
+     *
+     * On gfx10 and gfx11 a scalar miss goes on to the GL1, and the fence empties the GL1 with
+     * buffer_gl1_inv, an instruction of the vector memory path. A scalar load right behind it
+     * still found the line a launch earlier had left there: on an RX 7900 XT, in a copy of
+     * tests/device_test.cpp's chained probe, up to 1.6% of the readers in a run saw the previous
+     * launch's value. s_gl1_inv empties the GL1 from the scalar path, ahead of the scalar cache,
+     * and no reader saw a stale value with it. */
+#if defined(__GFX10__) || defined(__GFX11__)
+    asm volatile("s_gl1_inv\n\ts_dcache_inv" ::: "memory");
+#else
     asm volatile("s_dcache_inv" ::: "memory");
+#endif
 }
 
 __device__ __forceinline__ void rad_chain_done() {
