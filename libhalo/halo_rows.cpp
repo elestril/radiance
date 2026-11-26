@@ -1864,7 +1864,9 @@ static const RadOperandSpec oRmsNormHadQuant[] = {
 };
 
 /* `act` names the gate: "silu" for down_proj's input, "sigmoid" for a gated-attention o_proj's.
- * `mode` is libhalo's optional integer spelling of the same choice; `act` wins if both are given. */
+ * `mode` is libhalo's optional integer spelling of the same choice; `act` wins if both are given.
+ * libref's schema slot for slot (pGatedQuantCap): the SiTU caps are optional, and the shim
+ * refuses a nonzero one, which this kernel does not apply. */
 static const RadParamSpec pGatedHadQuant[] = {
     P_INT("M"),
     P_INT("n"),
@@ -1872,6 +1874,8 @@ static const RadParamSpec pGatedHadQuant[] = {
     P_STR("dtype"),
     P_STRO("act"),
     P_INTO("mode"),                         /* 0 = silu(a)*b, 1 = sigmoid(a)*b */
+    P_F64O("gate_cap"),
+    P_F64O("up_cap"),
 };
 static const RadOperandSpec oGatedHadQuant[] = {
     { "a",     RAD_OPD_IN,  0 },

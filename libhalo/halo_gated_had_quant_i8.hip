@@ -96,6 +96,9 @@ extern "C" int halo_rad_gated_had_quant_i8(const RadArgs* args, RadStream stream
   const RadTensor* sc = halo_opt(args, GH_S);
   if (!ta || !q || !sc) return HALO_NO(RAD_E_INVAL);
   if (!halo_contig(q) || !halo_contig(sc)) return HALO_NO(RAD_E_STRIDE);
+  // The SiTU softcaps of libref's schema are not applied here.
+  if (halo_getf(args, "gate_cap", 0.0) != 0.0 || halo_getf(args, "up_cap", 0.0) != 0.0)
+    return HALO_NO(RAD_E_UNSUPPORTED);
 
   const long long K = halo_geti_or(args, "n", 0);   // the GATED width, half of a packed row
   if (K < 1) return HALO_NO(RAD_E_INVAL);
