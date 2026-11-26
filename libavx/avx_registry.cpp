@@ -562,6 +562,13 @@ static const RadParamSpec pMoeGemmQ[]   = { P_INT("M"), P_INT("N"), P_INT("K"), 
                                             P_INT("top_k"), P_INT("group"), P_STR("a_order"),
                                             P_STR("dtype"), P_INTO("N_odd"), P_INTO("K_odd"),
                                             P_INTO("parts"), P_INTO("a_group") };
+/* The kernel reads the activation's scale grid at `a_group`, else at `group`, and refuses a stream
+ * on another grid (avx_moe.cpp). At dtype w4a8 libref's schema keeps the activation at one scale
+ * per 128 of K and lets `group` name the weight's grid alone, so at Q4_0's group 32 (a QAT
+ * checkpoint's experts, stated with no `a_group`) the two disagree. No caller states an activation
+ * grid finer than 64 (NVFP4's), so a floor of 64 keeps every geometry the kernel serves and drops
+ * the one it refuses. */
+static const RadConstraint cMoeGemmQ[] = { RAD_CGE("group", 64) };
 static const RadOperandSpec oMoeGemmQ[] = { OPD("a"), OPD_O("a_scale"), WTAB("w"), WTAB("w_scale"),
                                             OPD("sorted_tok"), OPD("expert_offset"),
                                             WTAB("w_odd"), WTAB("w_odd_scale"), OUT("y"),
@@ -1612,7 +1619,7 @@ static const RadOpSchema kSchemas[] = {
  *
  * Every row is domain HOST at priority 0 and unconstrained, except `block_size` on attn_paged and
  * kv_store (as in libref): the constraint admits any value but requires the key to be present,
- * since the cache cannot be walked without the block edge.
+ * since the cache cannot be walked without the block edge; and `group` on moe_gemm_q (cMoeGemmQ).
  *
  * Every row's shape is "any", since every extent is read from the operands (avx_common.h). The
  * ISA level is deliberately not a constraint: rows are identical on every CPU and only the code
@@ -1694,10 +1701,11 @@ static int avx_moe_cb_unrelayout(const RadParam* p, int n_p, int operand, const 
     return rc < 0 ? rc : rad_planes_unrelayout(enc, sel, src, src_bytes, planes, n_planes);
 }
 
-#define ROW_CB(nm, opname, fam, what, dts, fn)                                                    \
+#define ROW_CBC(nm, opname, fam, what, dts, cons, ncons, fn)                                      \
     { nm, opname, fam, what, SHAPE_ANY, dts, RAD_DOMAIN_HOST, 0,                                  \
-      nullptr, 0, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_moe_cb_layout,          \
+      cons, ncons, nullptr, 0, nullptr, nullptr, nullptr, fn, nullptr, avx_moe_cb_layout,         \
       avx_moe_cb_relayout, nullptr, avx_moe_cb_unrelayout, nullptr }
+#define ROW_CB(nm, opname, fam, what, dts, fn) ROW_CBC(nm, opname, fam, what, dts, nullptr, 0, fn)
 
 /* A row whose weight operands may be joined over several planes (avx_planes.h): libref's hooks for
  * the op, restated, so both libraries store and read one form. */
@@ -2005,9 +2013,9 @@ SIMPLE("avx_moe_scatter", "moe_scatter", "moe", "stable counting sort of routing
        "i32 indices", L(moe_scatter)),
 SIMPLE("avx_moe_gemm", "moe_gemm", "moe", "grouped GEMM over the expert-sorted rows", DT_FLOAT,
        L(moe_gemm)),
-ROW_CB("avx_moe_gemm_q", "moe_gemm_q", "moe",
-       "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT_CB,
-       L(moe_gemm_q)),
+ROW_CBC("avx_moe_gemm_q", "moe_gemm_q", "moe",
+        "grouped GEMM over the expert-sorted rows, quantised operands", DT_FLOAT_CB,
+        cMoeGemmQ, (int)(sizeof(cMoeGemmQ) / sizeof(cMoeGemmQ[0])), L(moe_gemm_q)),
 ROW_CB("avx_moe_gemm_q_mod4", "moe_gemm_q_mod4", "moe",
        "grouped GEMM over the expert-sorted rows, quantised operands, four classes by number mod 4",
        DT_FLOAT_CB, L(moe_gemm_q_mod4)),
